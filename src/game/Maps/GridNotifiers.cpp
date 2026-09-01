@@ -212,7 +212,13 @@ ObjectUpdater::Visit(GridRefManager<T> &m)
 {
     for (typename GridRefManager<T>::iterator iter = m.begin(); iter != m.end(); ++iter)
     {
-        WorldObject::UpdateHelper helper(iter->getSource());
+
+        T* obj = iter->getSource();
+
+        if (!obj || !obj->IsInWorld())
+            continue;
+
+        WorldObject::UpdateHelper helper(obj);
         helper.UpdateRealTime(i_now, i_timeDiff);
     }
 }
