@@ -320,19 +320,33 @@ bool MMapManager::unloadMapInstance(uint32 mapId, std::thread::id instanceId)
 
 dtNavMesh const* MMapManager::GetNavMesh(uint32 mapId)
 {
-    if (loadedMMaps.find(mapId) == loadedMMaps.end())
+    // BUGFIX: loadedMMaps is mutated (inserted into) by loadMapData() under
+    // loadedMMaps_lock while bots/players are pathing concurrently on other
+    // threads. Reading it here without the same lock is a data race on the
+    // underlying std::unordered_map -- observed as sporadic SIGSEGV deep
+    // inside dtNavMeshQuery::findPath() when a lookup landed mid-rehash.
+    std::shared_lock<std::shared_mutex> mapsLock(loadedMMaps_lock);
+    MMapDataSet::const_iterator itr = loadedMMaps.find(mapId);
+    if (itr == loadedMMaps.end())
         return nullptr;
 
-    return loadedMMaps[mapId]->navMesh;
+    return itr->second->navMesh;
 }
 
 dtNavMeshQuery const* MMapManager::GetNavMeshQuery(uint32 mapId)
 {
-    if (loadedMMaps.find(mapId) == loadedMMaps.end())
+    // BUGFIX: see GetNavMesh() above -- same unsynchronized read of
+    // loadedMMaps. This is the hot path (called on every PathInfo::calculate()),
+    // so it's the most likely place to actually hit the race in practice.
+    std::shared_lock<std::shared_mutex> mapsLock(loadedMMaps_lock);
+    MMapDataSet::const_iterator mapItr = loadedMMaps.find(mapId);
+    if (mapItr == loadedMMaps.end())
         return nullptr;
 
+    MMapData* mmap = mapItr->second;
+    mapsLock.unlock(); // done with loadedMMaps; don't hold it while locking navMeshQueries_lock below
+
     std::thread::id tid= std::this_thread::get_id();
-    MMapData* mmap = loadedMMaps[mapId];
     std::shared_lock<std::shared_mutex> lock(mmap->navMeshQueries_lock);
 
     NavMeshQuerySet::iterator it = mmap->navMeshQueries.find(tid);

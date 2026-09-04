@@ -304,7 +304,10 @@ void Object::BuildCreateUpdateBlockForPlayer(UpdateData *data, Player *target) c
 
     ByteBuffer& buf = data->AddUpdateBlockAndGetBuffer();
     buf << (uint8)updatetype;
-    buf << GetPackGUID();
+
+    PackedGuid packedGuid(GetObjectGuid());
+    buf << packedGuid;
+
     buf << uint8(m_objectTypeId);
     
     BuildMovementUpdate(&buf, updateFlags);

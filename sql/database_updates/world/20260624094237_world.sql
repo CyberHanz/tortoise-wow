@@ -2,7 +2,10 @@
 -- FILE: broadcast_text.sql
 -- GENERATED: 20260624094237
 -- ==============================================
-INSERT INTO `broadcast_text`
+
+SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0;
+
+INSERT IGNORE INTO `broadcast_text`
 (
     `entry`,
     `male_text`,
@@ -435,7 +438,7 @@ WHERE `entry` IN (
 -- FILE: gossip_menu_option.sql
 -- GENERATED: 20260624094237
 -- ==============================================
-INSERT INTO `gossip_menu_option`
+INSERT IGNORE INTO `gossip_menu_option`
 (
     `menu_id`,
     `id`,

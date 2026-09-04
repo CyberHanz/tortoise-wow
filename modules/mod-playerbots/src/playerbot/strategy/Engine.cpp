@@ -911,7 +911,7 @@ void Engine::LogAction(const char* format, ...)
         else if (strncmp(buf, "T:", 2) == 0)           tag = "TRIGGER_REASON";
         else if (strncmp(buf, "--- AI Tick", 11) == 0) tag = "TICK";
         else if (strncmp(buf, "no actions", 10) == 0)  tag = "NO_ACTION";
-        ai::botdiag::BotActionLog::Write(ai, tag, "%s", buf);
+        ai::botdiag::BotActionLog::Write(ai, tag, "state=%u engine=%p %s", static_cast<unsigned>(state), static_cast<void*>(this), buf);
     }
 }
 

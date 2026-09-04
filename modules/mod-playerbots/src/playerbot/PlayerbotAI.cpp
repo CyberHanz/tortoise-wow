@@ -274,6 +274,8 @@ void PlayerbotAI::RevalidateMasterPointer()
 
 void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
 {
+    std::lock_guard<std::mutex> updateLock(aiUpdateMutex);
+
     AiObjectContext* context = aiObjectContext;
     std::string mapString = WorldPosition(bot).isInstance() ? "I" : std::to_string(bot->GetMapId());
     auto pmo = sPerformanceMonitor.start(PERF_MON_TOTAL, "PlayerbotAI::UpdateAI " + mapString, nullptr, bot->GetMapId(), bot->GetInstanceId());
