@@ -1743,6 +1743,21 @@ void PlayerbotAI::HandleCommand(uint32 type, const std::string& text, Player& fr
 
 void PlayerbotAI::HandleBotOutgoingPacket(const WorldPacket& packet)
 {
+    // This handler can run on another map worker than this bot's own UpdateAI().
+    // Do not mutate the shared cached master/masterGuid state here. Take one
+    // local snapshot for this entire packet handling call instead.
+    ObjectGuid const packetMasterGuid = masterGuid;
+    Player* const packetMaster =
+        packetMasterGuid ? sObjectAccessor.FindPlayer(packetMasterGuid) : nullptr;
+
+    auto const hasPacketRealPlayerMaster = [&]() -> bool
+    {
+        return packetMaster &&
+               (!GetBotAI(packetMaster) || GetBotAI(packetMaster)->IsRealPlayer());
+    };
+
+
+
     //if (packet.empty())
     //    return;
 
@@ -1992,7 +2007,7 @@ void PlayerbotAI::HandleBotOutgoingPacket(const WorldPacket& packet)
                     if (bot->InBattleGround() && !(isMentioned || (msgtype != CHAT_MSG_CHANNEL && !isFromFreeBot)))
                         return;
 
-                    if (HasRealPlayerMaster() && guid1 != GetMaster()->GetObjectGuid())
+                    if (hasPacketRealPlayerMaster() && guid1 != packetMaster->GetObjectGuid())
                         return;
 
                     if (lang == LANG_ADDON)
