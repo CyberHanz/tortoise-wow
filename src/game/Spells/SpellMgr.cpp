@@ -3569,6 +3569,43 @@ void SpellMgr::LoadSpells()
     }
 
     LoadSpellExtra();
+    LoadSpellScriptNames();
+}
+
+// Overlay spell_template.script_name onto DBC-loaded SpellEntry objects.
+// With LoadSpellsFromSql = 0, spell data still comes from Spell.dbc; only
+// ScriptId is supplemented from the world database.
+void SpellMgr::LoadSpellScriptNames()
+{
+    std::unique_ptr<QueryResult> result(WorldDatabase.Query(
+        "SELECT `entry`, `script_name` FROM `spell_template` WHERE `script_name` <> ''"));
+
+    if (!result)
+    {
+        sLog.outString("Loaded 0 spell script_name bindings.");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 const spellId = fields[0].GetUInt32();
+        SpellEntry* spell = spellId < mSpellEntryMap.size() ? mSpellEntryMap[spellId].get() : nullptr;
+
+        if (!spell)
+        {
+            sLog.outErrorDb(
+                "Table `spell_template` has script_name '%s' for nonexistent spell (Id: %u), ignoring.",
+                fields[1].GetString(), spellId);
+            continue;
+        }
+
+        spell->ScriptId = sScriptMgr.GetScriptId(fields[1].GetString());
+        ++count;
+    } while (result->NextRow());
+
+    sLog.outString("Loaded %u spell script_name bindings.", count);
 }
 
 void SpellMgr::LoadSpellExtra()
