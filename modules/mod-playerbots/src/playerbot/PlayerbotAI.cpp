@@ -292,6 +292,18 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
     // we never deref the cached `master` pointer in this check.
     RevalidateMasterPointer();
 
+    // Bugfix: drains chatCommands (see HandleCommands()/PushChatCommand() -- this used to
+    // be dead code, and "reset"/"do "/"logout"/"wait " used to run inline from whatever
+    // thread called HandleCommand() instead of here). Placed here, unconditionally, on
+    // the map thread, rather than inside UpdateAIInternal(): that function is skipped for
+    // up to CONFIG_UINT32(aiInternalUpdateDelay)-worth of ticks whenever
+    // CanUpdateAIInternal() is false (e.g. right after a "wait" command sets
+    // aiInternalUpdateDelay), which would otherwise leave a subsequent "reset"/"logout
+    // cancel" stuck in the queue for that entire window instead of running promptly like
+    // it did before this queue existed.
+    SC_PHASE("UpdateAI.chatCommands", bot ? bot->GetName() : "(null)");
+    HandleCommands();
+
     if(aiInternalUpdateDelay > elapsed)
     {
         aiInternalUpdateDelay -= elapsed;
@@ -1195,36 +1207,152 @@ void PlayerbotAI::OnResurrected()
     }
 }
 
+void PlayerbotAI::PushChatCommand(ChatCommandHolder const& cmd)
+{
+    std::scoped_lock lock(chatCommandsMutex);
+    chatCommands.push(cmd);
+}
+
+// Bugfix: this used to be dead code -- nothing called HandleCommands(), so chatCommands
+// only ever grew. It is now the sole consumer of that queue and always runs from
+// UpdateAI() on this bot's own Map::Update() thread, while the producer,
+// HandleCommand(), can run on World::ProcessAsyncPackets()'s thread instead (for
+// PARTY/RAID/GUILD/WHISPER/OFFICER/RAID_*/BATTLEGROUND_*/HARDCORE/DND chat -- see
+// WorldSession::GetChatPacketProcessingType()). "reset"/"do "/"d "/"logout"/"logout
+// cancel"/"wait " used to be executed inline, directly from HandleCommand(), which meant
+// Reset() and DoSpecificAction()->Engine::ExecuteAction() could run on that async thread
+// while this exact bot's own Engine::DoNextAction()/ProcessTriggers() ran concurrently on
+// a map thread -- Engine::Reset() deleting live TriggerNode*/ActionNode* while
+// ProcessTriggers() iterates the same lists matches the observed
+// ai::TriggerNode::getTrigger() ASan "unknown-crash" exactly. All five branches below are
+// unchanged from the old HandleCommand() body, just moved here so they only ever run on
+// this thread.
+//
+// The lock below only protects the handoff of the queue itself (mirrors the swap-and-
+// release pattern, not the "lock while executing" one chatReplies uses above) -- every
+// command runs after the lock is released, so nothing here can block or be blocked by a
+// concurrent PushChatCommand() from the async thread.
 void PlayerbotAI::HandleCommands()
 {
+    std::queue<ChatCommandHolder> local;
+    {
+        std::scoped_lock lock(chatCommandsMutex);
+        local.swap(chatCommands);
+    }
+
+    if (local.empty())
+        return;
+
     ExternalEventHelper helper(aiObjectContext);
     std::list<ChatCommandHolder> delayed;
-    while (!chatCommands.empty())
+
+    while (!local.empty())
     {
-        ChatCommandHolder holder = chatCommands.front();
+        ChatCommandHolder holder = local.front();
+        local.pop();
+
         time_t checkTime = holder.GetTime();
         if (checkTime && time(0) < checkTime)
         {
             delayed.push_back(holder);
-            chatCommands.pop();
             continue;
         }
 
         std::string command = holder.GetCommand();
-        Player* owner = holder.GetOwner();
-        if (!helper.ParseChatCommand(command, owner) && holder.GetType() == CHAT_MSG_WHISPER)
-        {
-            //ostringstream out; out << "Unknown command " << command;
-            //TellPlayer(out);
-            //helper.ParseChatCommand("help");
-        }
+        // Bugfix: re-resolve the sender from the guid captured at enqueue time (see
+        // ChatCommandHolder) rather than trusting a stale pointer -- the sender may have
+        // logged out while this command sat queued/delayed. "reset" doesn't need an owner
+        // at all; "logout"/"logout cancel"/"wait " only need one for the whisper-back, so
+        // those still apply their state change with owner == nullptr. Everything else
+        // (do/d, warning, general commands) is skipped rather than run with a
+        // resolved-null owner, since those ultimately reach many different Action/Trigger
+        // implementations that all assume a live Player and were never audited for that.
+        ObjectGuid ownerGuid = holder.GetOwnerGuid();
+        Player* owner = ownerGuid ? sObjectAccessor.FindPlayer(ownerGuid) : nullptr;
+        uint32 type = holder.GetType();
 
-        chatCommands.pop();
+        // Bugfix: track whether "d "/"do " already dispatched so this doesn't also fall
+        // through to the generic ParseChatCommand() lookup below -- in the old (dead)
+        // HandleCommands() that fallthrough was inert because nothing ever drained the
+        // queue; now that it runs for real, a plain "do sit" must not also be looked up
+        // as an unrelated Trigger named "do"/"do sit".
+        bool handled = false;
+
+        if (owner && ((command.size() > 2 && command.substr(0, 2) == "d ") || (command.size() > 3 && command.substr(0, 3) == "do ")))
+        {
+            Event event("do", "", owner);
+            std::string action = command.substr(command.find(" ") + 1);
+            DoSpecificAction(action, event);
+            handled = true;
+        }
+        if (!handled && owner && ChatHelper::parseValue("command", command).substr(0, 3) == "do ")
+        {
+            Event event("do", "", owner);
+            std::string action = ChatHelper::parseValue("command", command);
+            action = action.substr(3);
+            DoSpecificAction(action, event);
+            handled = true;
+        }
+        if (!handled)
+        {
+            if (command == "reset")
+            {
+                Reset(true);
+            }
+            else if (command == "logout")
+            {
+                if (!(bot->IsStunnedByLogout() || bot->GetSession()->isLogingOut()))
+                {
+                    if (type == CHAT_MSG_WHISPER && owner)
+                        TellPlayer(owner, BOT_TEXT("logout_start"));
+
+                    if (master && GetBotMgr(master))
+                        SetShouldLogOut(true);
+                }
+            }
+            else if (command == "logout cancel")
+            {
+                if (bot->IsStunnedByLogout() || bot->GetSession()->isLogingOut())
+                {
+                    if (type == CHAT_MSG_WHISPER && owner)
+                        TellPlayer(owner, BOT_TEXT("logout_cancel"));
+
+                    WorldPacket p;
+                    bot->GetSession()->HandleLogoutCancelOpcode(p);
+                    SetShouldLogOut(false);
+                }
+            }
+            else if ((command.size() > 5) && (command.substr(0, 5) == "wait ") && (command.find("wait for attack") == std::string::npos))
+            {
+                std::string remaining = command.substr(command.find(" ") + 1);
+                uint32 delay = atof(remaining.c_str()) * static_cast<uint32>(IN_MILLISECONDS);
+                if (delay > 20000)
+                {
+                    if (owner)
+                        TellPlayer(owner, "Max wait time is 20 seconds!");
+                }
+                else
+                {
+                    IncreaseAIInternalUpdateDelay(delay);
+                    isWaiting = true;
+                    if (owner)
+                        TellPlayer(owner, "Waiting for " + remaining + " seconds!");
+                }
+            }
+            else if (owner && !helper.ParseChatCommand(command, owner) && type == CHAT_MSG_WHISPER)
+            {
+                //ostringstream out; out << "Unknown command " << command;
+                //TellPlayer(out);
+                //helper.ParseChatCommand("help");
+            }
+        }
     }
 
-    for (std::list<ChatCommandHolder>::iterator i = delayed.begin(); i != delayed.end(); ++i)
+    if (!delayed.empty())
     {
-        chatCommands.push(*i);
+        std::scoped_lock lock(chatCommandsMutex);
+        for (std::list<ChatCommandHolder>::iterator i = delayed.begin(); i != delayed.end(); ++i)
+            chatCommands.push(*i);
     }
 }
 
@@ -1551,24 +1679,36 @@ void PlayerbotAI::HandleCommand(uint32 type, const std::string& text, Player& fr
     if (type == CHAT_MSG_RAID_WARNING && filtered.find(bot->GetName()) != std::string::npos && filtered.find("award") == std::string::npos)
     {
         ChatCommandHolder cmd("warning", &fromPlayer, type);
-        chatCommands.push(cmd);
+        PushChatCommand(cmd);
         return;
     }
 
-    if ((filtered.size() > 2 && filtered.substr(0, 2) == "d ") || (filtered.size() > 3 && filtered.substr(0, 3) == "do "))
+    // Bugfix: "do "/"d ", "reset", "logout", "logout cancel" and "wait " used to be
+    // executed right here, inline -- but this function can run on
+    // World::ProcessAsyncPackets()'s thread (for PARTY/RAID/GUILD/WHISPER/OFFICER/RAID_*/
+    // BATTLEGROUND_*/HARDCORE/DND chat), concurrently with this exact bot's own
+    // Engine::DoNextAction()/ProcessTriggers() on a Map::Update() thread. Reset() and
+    // DoSpecificAction()->Engine::ExecuteAction() mutate the live Engine (currentEngine,
+    // triggers, action queue) with no locking, so an ordinary "/p reset" or "/p do sit"
+    // from any grouped player raced Engine::Reset() deleting live TriggerNode*/ActionNode*
+    // against ProcessTriggers() iterating the same lists -- matching the observed
+    // ai::TriggerNode::getTrigger() ASan "unknown-crash". All five now only ever queue for
+    // HandleCommands(), which drains them on this bot's own update thread and reproduces
+    // the exact original dispatch (see there).
+    if ((filtered.size() > 2 && filtered.substr(0, 2) == "d ") ||
+        (filtered.size() > 3 && filtered.substr(0, 3) == "do ") ||
+        ChatHelper::parseValue("command", filtered).substr(0, 3) == "do " ||
+        filtered == "reset" ||
+        filtered == "logout" ||
+        filtered == "logout cancel" ||
+        ((filtered.size() > 5) && (filtered.substr(0, 5) == "wait ") && (filtered.find("wait for attack") == std::string::npos)))
     {
-        Event event("do", "", &fromPlayer);
-        std::string action = filtered.substr(filtered.find(" ") + 1);
-        DoSpecificAction(action, event);
+        ChatCommandHolder cmd(filtered, &fromPlayer, type);
+        PushChatCommand(cmd);
+        return;
     }
-    if (ChatHelper::parseValue("command", filtered).substr(0, 3) == "do ")
-    {
-        Event event("do", "", &fromPlayer);
-        std::string action = ChatHelper::parseValue("command", filtered);
-        action = action.substr(3);
-        DoSpecificAction(action, event);
-    }
-    else if (type != CHAT_MSG_WHISPER && filtered.size() > 6 && filtered.substr(0, 6) == "queue ")
+
+    if (type != CHAT_MSG_WHISPER && filtered.size() > 6 && filtered.substr(0, 6) == "queue ")
     {
         std::string remaining = filtered.substr(filtered.find(" ") + 1);
         int index = 1;
@@ -1587,49 +1727,7 @@ void PlayerbotAI::HandleCommand(uint32 type, const std::string& text, Player& fr
             }
         }
         ChatCommandHolder cmd(remaining, &fromPlayer, type, time(0) + index);
-        chatCommands.push(cmd);
-    }
-    else if (filtered == "reset")
-    {
-        Reset(true);
-    }
-    else if (filtered == "logout")
-    {
-        if (!(bot->IsStunnedByLogout() || bot->GetSession()->isLogingOut()))
-        {
-            if (type == CHAT_MSG_WHISPER)
-                TellPlayer(&fromPlayer, BOT_TEXT("logout_start"));
-
-            if (master && GetBotMgr(master))
-                SetShouldLogOut(true);
-        }
-    }
-    else if (filtered == "logout cancel")
-    {
-        if (bot->IsStunnedByLogout() || bot->GetSession()->isLogingOut())
-        {
-            if (type == CHAT_MSG_WHISPER)
-                TellPlayer(&fromPlayer, BOT_TEXT("logout_cancel"));
-
-            WorldPacket p;
-            bot->GetSession()->HandleLogoutCancelOpcode(p);
-            SetShouldLogOut(false);
-        }
-    }
-    else if ((filtered.size() > 5) && (filtered.substr(0, 5) == "wait ") && (filtered.find("wait for attack") == std::string::npos))
-    {
-        std::string remaining = filtered.substr(filtered.find(" ") + 1);
-        uint32 delay = atof(remaining.c_str()) * static_cast<uint32>(IN_MILLISECONDS);
-        if (delay > 20000)
-        {
-            TellPlayer(&fromPlayer, "Max wait time is 20 seconds!");
-            return;
-        }
-
-        IncreaseAIInternalUpdateDelay(delay);
-        isWaiting = true;
-        TellPlayer(&fromPlayer, "Waiting for " + remaining + " seconds!");
-        return;
+        PushChatCommand(cmd);
     }
     else
     {
@@ -1639,7 +1737,7 @@ void PlayerbotAI::HandleCommand(uint32 type, const std::string& text, Player& fr
                (unsigned)type,
                filtered.c_str());
         ChatCommandHolder cmd(filtered, &fromPlayer, type);
-        chatCommands.push(cmd);
+        PushChatCommand(cmd);
     }
 }
 

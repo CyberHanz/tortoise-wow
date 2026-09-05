@@ -334,24 +334,32 @@ private:
 class ChatCommandHolder
 {
 public:
-    ChatCommandHolder(std::string command, Player* owner = NULL, uint32 type = CHAT_MSG_WHISPER, time_t time = 0) : command(command), owner(owner), type(type), time(time) {}
+    // Bugfix: this used to store a raw Player* owner. HandleCommands() was dead code
+    // before this patch, so nothing ever dereferenced a stale one -- now that
+    // HandleCommands() actually drains this queue (including after a real wall-clock
+    // delay for "queue ..." commands), the sender can log out and be destroyed in the
+    // meantime. Store the guid instead and re-resolve via sObjectAccessor.FindPlayer()
+    // at execution time, exactly like RevalidateMasterPointer() already does for
+    // `master`/`masterGuid`.
+    ChatCommandHolder(std::string command, Player* owner = NULL, uint32 type = CHAT_MSG_WHISPER, time_t time = 0)
+        : command(command), ownerGuid(owner ? owner->GetObjectGuid() : ObjectGuid()), type(type), time(time) {}
     ChatCommandHolder(ChatCommandHolder const& other)
     {
         this->command = other.command;
-        this->owner = other.owner;
+        this->ownerGuid = other.ownerGuid;
         this->type = other.type;
         this->time = other.time;
     }
 
 public:
     std::string GetCommand() { return command; }
-    Player* GetOwner() { return owner; }
+    ObjectGuid GetOwnerGuid() { return ownerGuid; }
     uint32 GetType() { return type; }
     time_t GetTime() { return time; }
 
 private:
     std::string command;
-    Player* owner;
+    ObjectGuid ownerGuid;
     uint32 type;
     time_t time;
 };
@@ -367,6 +375,12 @@ public:
 
     void HandleCommands();
 private:
+    // Bugfix: producer-side push for chatCommands, used from HandleCommand() -- which
+    // can run on World::ProcessAsyncPackets()'s thread for PARTY/RAID/GUILD/WHISPER/etc.
+    // chat -- and drained by HandleCommands() on this bot's own Map::Update() thread.
+    // See the comment on HandleCommand()/HandleCommands() in PlayerbotAI.cpp.
+    void PushChatCommand(ChatCommandHolder const& cmd);
+
     void UpdateAIInternal(uint32 elapsed, bool minimal = false) override;
 public:    
     static std::string BotStateToString(BotState state);
@@ -814,6 +828,11 @@ protected:
     BotState currentState;
     ChatHelper chatHelper;
     std::queue<ChatCommandHolder> chatCommands;
+    // Bugfix: chatCommands is a genuine cross-thread producer/consumer queue --
+    // HandleCommand() (producer) can run on World::ProcessAsyncPackets()'s thread;
+    // HandleCommands() (consumer) always runs on this bot's own Map::Update() thread.
+    // Mirrors chatRepliesMutex below.
+    std::mutex chatCommandsMutex;
     std::queue<ChatQueuedReply> chatReplies;
     std::mutex chatRepliesMutex;
     std::mutex aiUpdateMutex;
