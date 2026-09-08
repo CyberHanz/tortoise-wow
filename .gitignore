@@ -18,3 +18,16 @@
 # DiscardRoute benennt .route/.cpp in .bad um, wenn die Stuck-Leiter auf
 # einer aufgezeichneten Route auslief). Ausschuss, kein Repo-Inhalt.
 *.bad
+
+# Hans local/debug files
+/runtime-configs/
+/ai_updates/
+/asan_report.*
+/batch*
+/database*.sh
+/restore_mutex.py
+/hans.txt
+/m_appliedMods
+/spellId.
+*.bak*
+*.before*
