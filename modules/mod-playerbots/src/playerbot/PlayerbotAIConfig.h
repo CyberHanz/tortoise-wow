@@ -361,6 +361,8 @@ public:
 
     uint32 guildRepliesRate;
 
+    uint32 partyInterjectionChance;
+
     uint32 botAcceptDuelMinimumLevel;
 
     bool talentsInPublicNote;

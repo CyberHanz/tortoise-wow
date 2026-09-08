@@ -6,6 +6,8 @@
 #include <numeric>
 #include <iomanip>
 #include <regex>
+#include <cctype>
+#include <algorithm>
 #include <boost/algorithm/string.hpp>
 
 using namespace ai;
@@ -430,6 +432,133 @@ std::set<std::string> ChatHelper::parseItemQualifiers(const std::string& text)
     }
 
     return qualifiers;
+}
+
+namespace
+{
+    // Ticket 4a: keeps numeric fields compact -- an exact integer prints as
+    // an integer, anything else prints with one decimal. Used only for the
+    // float fields on ItemPrototype (Damage/weapon speed) below.
+    std::string FormatCompactNumber(float value)
+    {
+        std::ostringstream out;
+        if (value == static_cast<int64>(value))
+            out << static_cast<int64>(value);
+        else
+            out << std::fixed << std::setprecision(1) << value;
+        return out.str();
+    }
+}
+
+// Ticket 4a: chat itemlink grounding -- see the declaration in ChatHelper.h
+// for the full contract. Reuses parseItemQualifiers() above to find every
+// link, ItemQualifier to parse each one, and ItemQualifier::GetProto() to
+// resolve it against the in-memory item template cache (no DB query). Name
+// resolution mirrors formatItem() below exactly (localized name override,
+// then the random-property suffix) -- just emitted as plain text instead of
+// a chat-link, since this goes into the LLM prompt, not to chat. An item id
+// that no longer resolves (removed/unknown) is skipped rather than
+// reported with guessed data.
+std::string ChatHelper::BuildItemContextBlock(const std::string& message)
+{
+    std::set<std::string> qualifierStrings = parseItemQualifiers(message);
+    if (qualifierStrings.empty())
+        return "";
+
+    const size_t maxItems = 5; // keep the block small -- see the comment on the declaration.
+    int loc_idx = sPlayerbotTextMgr.GetLocalePriority();
+
+    std::ostringstream out;
+    out << "<item data>\n";
+    size_t resolvedCount = 0;
+
+    for (const std::string& qualifierString : qualifierStrings)
+    {
+        if (resolvedCount >= maxItems)
+            break;
+
+        ItemQualifier qualifier(qualifierString);
+        ItemPrototype const* proto = qualifier.GetProto();
+        if (!proto)
+            continue; // unknown/removed item id -- nothing authoritative to report, skip rather than guess.
+
+        ++resolvedCount;
+
+        std::string name = proto->Name1;
+        if (loc_idx >= 0)
+        {
+            std::string tname;
+            sObjectMgr.GetItemLocaleStrings(qualifier.GetId(), loc_idx, &tname);
+            if (!tname.empty())
+                name = tname;
+        }
+        if (qualifier.GetRandomPropertyId())
+        {
+            ItemRandomPropertiesEntry const* item_rand = sItemRandomPropertiesStore.LookupEntry(abs(qualifier.GetRandomPropertyId()));
+            if (item_rand)
+            {
+                int suffixLocIdx = loc_idx >= 0 ? loc_idx : 0;
+                std::string suffix = item_rand->nameSuffix[suffixLocIdx];
+                if (!suffix.empty())
+                    name += " " + suffix;
+            }
+        }
+
+        out << "- entry=" << proto->ItemId << " name=\"" << name << "\""
+            << " quality=" << proto->Quality
+            << " ilvl=" << proto->ItemLevel
+            << " class=" << proto->Class << "/" << proto->SubClass
+            << " invType=" << proto->InventoryType;
+
+        if (proto->Armor)
+            out << " armor=" << proto->Armor;
+
+        for (uint8 i = 0; i < MAX_ITEM_PROTO_DAMAGES; ++i)
+        {
+            if (proto->Damage[i].DamageMin || proto->Damage[i].DamageMax)
+            {
+                out << " dmg=" << FormatCompactNumber(proto->Damage[i].DamageMin) << "-" << FormatCompactNumber(proto->Damage[i].DamageMax);
+                break; // Ticket 4a keeps this compact -- primary damage roll only.
+            }
+        }
+
+        if (proto->Delay)
+            out << " speed=" << FormatCompactNumber(proto->Delay / 1000.0f) << "s";
+
+        std::string statsStr;
+        for (uint8 i = 0; i < MAX_ITEM_PROTO_STATS; ++i)
+        {
+            if (proto->ItemStat[i].ItemStatValue)
+            {
+                if (!statsStr.empty())
+                    statsStr += ",";
+                statsStr += "mod" + std::to_string(proto->ItemStat[i].ItemStatType) + ":" + std::to_string(proto->ItemStat[i].ItemStatValue);
+            }
+        }
+        if (!statsStr.empty())
+            out << " stats=[" << statsStr << "]";
+
+        std::string spellsStr;
+        for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+        {
+            if (proto->Spells[i].SpellId)
+            {
+                if (!spellsStr.empty())
+                    spellsStr += ",";
+                spellsStr += std::to_string(proto->Spells[i].SpellId);
+            }
+        }
+        if (!spellsStr.empty())
+            out << " spells=[" << spellsStr << "]";
+
+        out << "\n";
+    }
+
+    if (!resolvedCount)
+        return ""; // every link failed to resolve -- nothing authoritative to add.
+
+    out << "</item data>";
+    return out.str();
 }
 
 std::string ChatHelper::formatQuest(Quest const* quest)
@@ -1087,6 +1216,27 @@ std::string ChatHelper::formatRace(uint8 race)
     return races[race];
 }
 
+std::string ChatHelper::formatLifeState(Unit* unit)
+{
+    if (!unit)
+        return "unknown"; // missing state must never be reported as an authoritative "alive"
+
+    switch (unit->GetDeathState())
+    {
+        case JUST_DIED:
+        case CORPSE:
+        case CORPSE_FALLING:
+            return "dead";
+        case DEAD:
+            return "ghost";
+        case ALIVE:
+        case JUST_ALIVED:
+            return "alive";
+        default:
+            return "unknown"; // unhandled/future DeathState value -- never guess "alive"
+    }
+}
+
 std::string ChatHelper::formatFactionName(uint32 factionId)
 {
     std::string name = "unknown faction";
@@ -1106,6 +1256,439 @@ std::string ChatHelper::formatFactionName(uint32 factionId)
     }
 
     return name;
+}
+
+bool ChatHelper::isNameMentioned(const std::string& message, const std::string& name)
+{
+    if (name.empty() || message.size() < name.size())
+        return false;
+
+    auto isBoundaryChar = [](unsigned char c) { return std::isalnum(c) == 0; };
+
+    for (size_t pos = 0; pos + name.size() <= message.size(); ++pos)
+    {
+        bool match = true;
+        for (size_t i = 0; i < name.size(); ++i)
+        {
+            if (std::tolower(static_cast<unsigned char>(message[pos + i])) != std::tolower(static_cast<unsigned char>(name[i])))
+            {
+                match = false;
+                break;
+            }
+        }
+
+        if (!match)
+            continue;
+
+        bool leftOk = (pos == 0) || isBoundaryChar(message[pos - 1]);
+        size_t afterPos = pos + name.size();
+        bool rightOk = (afterPos == message.size()) || isBoundaryChar(message[afterPos]);
+
+        if (leftOk && rightOk)
+            return true;
+    }
+
+    return false;
+}
+
+namespace
+{
+    // One phrase profile per supported language. The detection algorithm below never
+    // looks at language directly -- it only ever iterates this table. Adding German,
+    // French, etc. later means adding one more entry here; needsCurrentLocationContext()
+    // itself does not change.
+    struct LocationPhraseProfile
+    {
+        std::vector<std::string> nonDisclosure;   // Tier 1: overrides everything to false.
+        std::vector<std::string> currentSpatial;  // Tier 2: current position/travel only.
+    };
+
+    const std::vector<LocationPhraseProfile>& GetLocationPhraseProfiles()
+    {
+        static const std::vector<LocationPhraseProfile> profiles = {
+            // English
+            {
+                {
+                    "don't say where you are", "don't tell me where you are",
+                    "do not tell me where you are", "do not mention your location",
+                    "don't reveal your location", "do not reveal your location"
+                },
+                {
+                    // "are you still in" removed -- false-triggers on "are you still in
+                    // the guild?" / "are you still in combat?" etc. Safer to miss a real
+                    // location question than inject location into unrelated chat; a
+                    // place-aware second-stage matcher can recover this case later.
+                    "where are you", "are you near me", "can you see me",
+                    "how far are you", "have you arrived",
+                    "are you on your way to", "are you coming here now",
+                    "where are you heading now", "where are you heading right now"
+                }
+            },
+            // Dutch
+            {
+                {
+                    "zeg niet waar je bent", "zeg niet waar je nu bent",
+                    "je mag niet zeggen waar je bent", "je mag niet zeggen waar je nu bent",
+                    "noem je locatie niet", "ik wil niet weten waar je bent",
+                    "ik wil niet weten waar je nu bent"
+                },
+                {
+                    // "ben je nog in" / "ben je al in" removed -- false-trigger on
+                    // "ben je nog in de guild?" / "ben je nog in leven?" / "ben je al in
+                    // de party?" etc. Same reasoning as "are you still in" above; a
+                    // place-aware second-stage matcher can recover this case later.
+                    "waar ben je", "waar sta je", "waar bevind je je",
+                    "sta je bij", "sta je in de buurt", "kun je mij zien",
+                    "kan je mij zien", "hoe ver ben je", "ben je al aangekomen",
+                    "kom je nu naar", "ga je nu naar", "ben je onderweg naar",
+                    "waar ben je onderweg naartoe"
+                }
+            }
+            // Add further languages here as new entries only.
+        };
+        return profiles;
+    }
+}
+
+bool ChatHelper::needsCurrentLocationContext(const std::string& message)
+{
+    for (const auto& profile : GetLocationPhraseProfiles())
+        for (const std::string& phrase : profile.nonDisclosure)
+            if (isNameMentioned(message, phrase))
+                return false;
+
+    for (const auto& profile : GetLocationPhraseProfiles())
+        for (const std::string& phrase : profile.currentSpatial)
+            if (isNameMentioned(message, phrase))
+                return true;
+
+    return false;
+}
+
+namespace
+{
+    // Ticket 3a: one profile per supported language, same shape/reasoning as
+    // GetLocationPhraseProfiles() above. This is a COARSE retrieval gate for
+    // the <persistent memory> prompt block, not a personal-info classifier
+    // and not per-fact relevance/ranking -- see needsPersistentMemoryContext()
+    // below and Ticket 3b (planned follow-up: unrelated questions that still
+    // pass this gate, per-fact relevance, repetition/recently-used penalty).
+    // smalltalkOverride is Tier 0 (checked first, overrides to false -- e.g.
+    // "hoe gaat het?" / "how are you?" are grammatically questions but must
+    // NOT trigger persistent-memory retrieval). questionWords is Tier 1
+    // (positive trigger, only reached if Tier 0 did not already exclude the
+    // message). Adding a language later means adding one more entry here.
+    struct MemoryGatePhraseProfile
+    {
+        std::vector<std::string> smalltalkOverride;
+        std::vector<std::string> questionWords;
+    };
+
+    const std::vector<MemoryGatePhraseProfile>& GetMemoryGatePhraseProfiles()
+    {
+        static const std::vector<MemoryGatePhraseProfile> profiles = {
+            // Dutch
+            {
+                { "hoe gaat het", "hoe is het", "alles goed" },
+                { "wat", "wie", "wanneer", "waar", "waarom", "hoe" }
+            },
+            // English
+            {
+                { "how are you", "how's it going", "what's up", "how you doing" },
+                { "what", "who", "when", "where", "why", "how" }
+            }
+            // Add further languages here as new entries only.
+        };
+        return profiles;
+    }
+}
+
+// Ticket 3a coarse retrieval gate (see the comment on GetMemoryGatePhraseProfiles()
+// above and on the declaration in ChatHelper.h): decides only WHETHER the
+// <persistent memory> block may be injected this turn, never WHICH facts or
+// WHOM about -- that is still entirely Ticket 2's ResolveMemorySubject() and
+// SayAction.cpp's existing GetActiveForSubject() call. Deliberately coarse:
+// known false positives (an unrelated question, e.g. "weet je hoeveel eieren
+// ik nu heb?", still passes) and false negatives (a genuine request typed
+// without "?" and without a recognised question word) are accepted for this
+// round -- see Ticket 3b for per-fact relevance/ranking and repetition
+// penalties, which is the intended way to narrow these further later.
+bool ChatHelper::needsPersistentMemoryContext(const std::string& message)
+{
+    // Tier 0: smalltalk/status-question override -- checked first, across
+    // every profile, before any positive trigger below. "hoe gaat het?" /
+    // "how are you?" contain both "?" and a question word ("hoe"/"how"), so
+    // without this tier they would incorrectly pass Tier 1.
+    for (const auto& profile : GetMemoryGatePhraseProfiles())
+        for (const std::string& phrase : profile.smalltalkOverride)
+            if (isNameMentioned(message, phrase))
+                return false;
+
+    // Tier 1a: "?" anywhere is a language-independent signal on its own --
+    // NL and EN both use it, so this alone already covers most genuine
+    // questions in either language without needing a matched question word.
+    if (message.find('?') != std::string::npos)
+        return true;
+
+    // Tier 1b: fallback for a genuine question typed without "?" -- a
+    // boundary-safe question word from either language's profile.
+    for (const auto& profile : GetMemoryGatePhraseProfiles())
+        for (const std::string& word : profile.questionWords)
+            if (isNameMentioned(message, word))
+                return true;
+
+    return false;
+}
+
+namespace
+{
+    // Ticket 3b1: Phase-1 BOOTSTRAP concept set -- deliberately NOT declared
+    // in ChatHelper.h and NOT a ChatHelper member: nothing outside this
+    // translation unit may depend on this enum, or even on the fact that
+    // matching is enum-based at all (see ChatHelper::FilterRelevantMemories()
+    // in ChatHelper.h for the one thing callers are meant to see instead).
+    // COLOR / CITY_PLACE / FRIENDSHIP only, covering what the live memory
+    // data actually uses today. Explicitly NOT the final architecture for
+    // memory relevance, and NOT meant to be grown one hardcoded value at a
+    // time into dozens of future categories (favorite food, dislikes, family
+    // members, hobbies, profession, ...) -- see the longer comment on
+    // FilterRelevantMemories() below and on its declaration in ChatHelper.h
+    // for the intended future direction (semantic/structured memory) that is
+    // expected to replace this matching without any caller needing to
+    // change.
+    enum class MemoryConcept
+    {
+        COLOR,
+        CITY_PLACE,
+        FRIENDSHIP
+    };
+
+    // Ticket 3b1: one profile per known CONCEPT (not per language -- a
+    // concept's phrase list simply mixes NL and EN concept-carrier words,
+    // since GetMemoryConcepts() below never needs to know which language
+    // matched, only which concept). Deliberately a small, fixed Phase-1 set
+    // covering only what the live memory data actually uses today; add a
+    // new concept here later the same way a new language is added to the
+    // other phrase-profile tables -- the matching function itself never
+    // needs to change. Deliberately CONCEPT-CARRIER words ("kleur"/"color")
+    // rather than VALUE words ("rood"/"red") to avoid unrelated false
+    // positives (a value word could appear in all kinds of unrelated
+    // sentences; a concept-carrier word reliably signals the topic).
+    struct MemoryConceptProfile
+    {
+        MemoryConcept conceptId;
+        std::vector<std::string> phrases;
+    };
+
+    const std::vector<MemoryConceptProfile>& GetMemoryConceptProfiles()
+    {
+        static const std::vector<MemoryConceptProfile> profiles = {
+            {
+                MemoryConcept::COLOR,
+                { "kleur", "favoriete kleur", "color", "colour", "favorite color", "favourite colour" }
+            },
+            {
+                MemoryConcept::CITY_PLACE,
+                { "stad", "plek", "favoriete stad", "favoriete plek",
+                  "city", "place", "favorite city", "favourite city", "favorite place", "favourite place" }
+            },
+            {
+                MemoryConcept::FRIENDSHIP,
+                { "vriend", "vriendin", "beste vriend", "beste vriendin", "friend", "best friend" }
+            }
+            // Add further concepts here as new entries only -- but see the
+            // caution above and on FilterRelevantMemories(): this bootstrap
+            // set is not meant to grow into a large hardcoded list. A real
+            // fix for the general "any topic, any phrasing" problem is
+            // future/separate scope (semantic/structured memory).
+        };
+        return profiles;
+    }
+
+    // Ticket 3b1: maps `text` (either the current question, or one stored
+    // fact's factOriginal) onto the small, fixed concept set above. Called
+    // independently for the question and for each candidate fact inside
+    // ChatHelper::FilterRelevantMemories() below, which intersects the two
+    // resulting sets. This function never compares question text against
+    // fact text directly, which is what keeps NL<->EN cross-language
+    // retrieval working: "mijn favoriete kleur is rood" and "what is
+    // Naomanda's favorite color?" both map onto {COLOR} independently, via
+    // their own language's concept-carrier word, without any shared
+    // vocabulary between the two strings. An empty result means `text`
+    // matched none of the known concepts -- treated as "no recognised
+    // concept", never as "match everything". File-local on purpose (not a
+    // ChatHelper method) -- see FilterRelevantMemories() for why this stays
+    // hidden from callers.
+    std::set<MemoryConcept> GetMemoryConcepts(const std::string& text)
+    {
+        std::set<MemoryConcept> concepts;
+        for (const auto& profile : GetMemoryConceptProfiles())
+            for (const std::string& phrase : profile.phrases)
+            {
+                if (ChatHelper::isNameMentioned(text, phrase))
+                {
+                    concepts.insert(profile.conceptId);
+                    break; // this concept already matched -- no need to check its remaining phrases
+                }
+            }
+        return concepts;
+    }
+}
+
+// Ticket 3b1: the single relevance entry point declared in ChatHelper.h --
+// see that declaration for the full contract (result meaning, bootstrap-vs-
+// final scope, where a future semantic representation plugs in later). This
+// is the ONLY piece of Ticket 3b1 exposed outside this translation unit:
+// SayAction.cpp calls this and only this -- MemoryConcept, GetMemoryConcepts()
+// and GetMemoryConceptProfiles() above are private implementation detail
+// that no caller may depend on.
+ChatHelper::MemoryRelevanceResult ChatHelper::FilterRelevantMemories(const std::string& message,
+    const std::vector<PlayerbotMemoryEntry>& allMemories, std::vector<PlayerbotMemoryEntry>& outRelevant)
+{
+    outRelevant.clear();
+
+    std::set<MemoryConcept> questionConcepts = GetMemoryConcepts(message);
+    if (questionConcepts.empty())
+        return MemoryRelevanceResult::NO_KNOWN_CONCEPT;
+
+    for (auto const& mem : allMemories)
+    {
+        std::set<MemoryConcept> factConcepts = GetMemoryConcepts(mem.factOriginal);
+
+        bool relevant = false;
+        for (MemoryConcept concept : factConcepts)
+        {
+            if (questionConcepts.count(concept))
+            {
+                relevant = true;
+                break;
+            }
+        }
+
+        if (relevant)
+            outRelevant.push_back(mem);
+    }
+
+    return outRelevant.empty() ? MemoryRelevanceResult::KNOWN_CONCEPT_NO_FACTS : MemoryRelevanceResult::FACTS_FOUND;
+}
+
+namespace
+{
+    // One profile per supported language. Phrases are checked longest-first
+    // within a profile so "onthoud dat"/"remember that" strip the connector
+    // word along with the verb, while the bare "onthoud"/"remember" still
+    // catches phrasing without "dat"/"that". Only the imperative verb form is
+    // listed -- no conjugations/synonyms ("ik onthoud", "onthouden",
+    // "remembers") on purpose, per the conservative-detection requirement:
+    // a false negative (Phase 1 misses a genuine request) is acceptable, a
+    // false positive (Phase 1 stores an ordinary sentence) is not.
+    struct MemoryPhraseProfile
+    {
+        std::string language;
+        std::vector<std::string> rememberPhrases;
+        std::vector<std::string> forgetPhrases;
+    };
+
+    const std::vector<MemoryPhraseProfile>& GetMemoryPhraseProfiles()
+    {
+        static const std::vector<MemoryPhraseProfile> profiles = {
+            // English
+            {
+                "en",
+                { "remember that", "remember" },
+                { "forget that", "forget" }
+            },
+            // Dutch
+            {
+                "nl",
+                { "onthoud dat", "onthou dat", "onthoud", "onthou" },
+                { "vergeet dat", "vergeet" }
+            }
+        };
+        return profiles;
+    }
+
+    // True if `text[pos]` is not a letter/digit, or `pos == text.size()` --
+    // i.e. the character right after a matched phrase is a real word
+    // boundary, not the start of a longer word ("remembers" must not match
+    // "remember"). Mirrors the boundary check ChatHelper::isNameMentioned
+    // already applies, kept local here since this scan is prefix-anchored
+    // rather than substring-anywhere.
+    bool IsBoundaryAt(const std::string& text, size_t pos)
+    {
+        if (pos >= text.size())
+            return true;
+        return std::isalnum(static_cast<unsigned char>(text[pos])) == 0;
+    }
+}
+
+ChatHelper::MemoryTriggerResult ChatHelper::detectMemoryTrigger(const std::string& message)
+{
+    MemoryTriggerResult result;
+
+    std::string working = message;
+    boost::trim(working);
+    if (working.empty())
+        return result;
+
+    // Strip a single optional leading vocative address ("Ravanne, " /
+    // "Ravanne: ") so a bot-name prefix doesn't prevent the trigger phrase
+    // from being recognised at the front of the message. The captured word
+    // itself is kept in `strippedVocative` and handed back to the caller as
+    // MemoryTriggerResult::addressedName -- callers (HandleMemoryCommand())
+    // compare THIS, and only this, against their own bot's name to decide
+    // who a broadcast-channel command is addressed to. This function itself
+    // deliberately does not know or care which bot is asking; it only
+    // records what was typed. Only a single alphabetic word is stripped, and
+    // only if it is short, to avoid eating into an actual sentence that
+    // happens to start with a comma-separated clause.
+    std::string strippedVocative;
+    size_t commaPos = working.find_first_of(",:");
+    if (commaPos != std::string::npos && commaPos > 0 && commaPos <= 24)
+    {
+        std::string lead = working.substr(0, commaPos);
+        bool leadIsWord = std::all_of(lead.begin(), lead.end(), [](unsigned char c) { return std::isalpha(c) != 0 || c == '\''; });
+        if (leadIsWord)
+        {
+            strippedVocative = lead;
+            working = working.substr(commaPos + 1);
+            boost::trim(working);
+        }
+    }
+
+    if (working.empty())
+        return result;
+
+    for (const auto& profile : GetMemoryPhraseProfiles())
+    {
+        for (const std::string& phrase : profile.rememberPhrases)
+        {
+            if (boost::algorithm::istarts_with(working, phrase) && IsBoundaryAt(working, phrase.size()))
+            {
+                result.action = MemoryTriggerAction::REMEMBER;
+                result.language = profile.language;
+                result.addressedName = strippedVocative;
+                result.factText = working.substr(phrase.size());
+                boost::trim(result.factText);
+                return result;
+            }
+        }
+
+        for (const std::string& phrase : profile.forgetPhrases)
+        {
+            if (boost::algorithm::istarts_with(working, phrase) && IsBoundaryAt(working, phrase.size()))
+            {
+                result.action = MemoryTriggerAction::FORGET;
+                result.language = profile.language;
+                result.addressedName = strippedVocative;
+                result.factText = working.substr(phrase.size());
+                boost::trim(result.factText);
+                return result;
+            }
+        }
+    }
+
+    return result;
 }
 
 uint32 ChatHelper::parseSkillName(const std::string& text)

@@ -223,6 +223,15 @@ bool QuestAction::AcceptQuest(Player* requester, Quest const* quest, uint64 ques
         {
             outputMessage = BOT_TEXT2("quest_error_cant_take", args);
         }
+        // Crash-analysis note (2026-09-07): if SatisfyQuestStatus() is true
+        // (so we don't hit quest_error_have_quest above) AND the master is
+        // absent/too far/no debug strategy, no branch here assigns
+        // outputMessage -- it stays "" from its declaration. This is one of
+        // two paths in this function that can reach TellPlayer() below with
+        // an empty message; deliberately left as-is for now (no new/fictional
+        // BOT_TEXT key, no invented text) -- the new empty-text guard in
+        // PlayerbotAI::TellPlayerNoFacing() now absorbs this safely instead
+        // of ever reaching bot->Say("").
     }
     else if (! bot->SatisfyQuestLog(false))
     {
@@ -254,6 +263,17 @@ bool QuestAction::AcceptQuest(Player* requester, Quest const* quest, uint64 ques
             outputMessage = BOT_TEXT2("quest_accepted", args);
             success = true;
         }
+        // Crash-analysis note (2026-09-07): if HandleQuestgiverAcceptQuestOpcode()
+        // did not actually move the quest out of NONE/AVAILABLE (accept silently
+        // rejected server-side after the earlier checks passed), outputMessage
+        // stays "" and success stays false -- this is the second path that can
+        // reach TellPlayer() below with an empty message (this was the live
+        // crash: bot->Say(text="") -> ByteBufferException in
+        // PlayerbotAI::HandleBotOutgoingPacket()). Deliberately left as-is for
+        // now (no new/fictional BOT_TEXT key, no invented text) -- the new
+        // empty-text guard in PlayerbotAI::TellPlayerNoFacing() now absorbs
+        // this safely, and the parser-side fix there no longer crashes on an
+        // empty chat packet either way.
     }
 
     if (success || !ai->GetMaster() || sServerFacade.GetDistance2d(bot, ai->GetMaster()) < sPlayerbotAIConfig.reactDistance || ai->HasStrategy("debug", BotState::BOT_STATE_NON_COMBAT))

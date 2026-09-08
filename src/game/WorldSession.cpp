@@ -301,7 +301,16 @@ void WorldSession::QueuePacket(WorldPacket* newPacket)
     if (newPacket->GetOpcode() == CMSG_MESSAGECHAT &&
         newPacket->size() >= sizeof(ChatPacketHeader) &&
         GetSecurity() == SEC_PLAYER) // gm commands need to be executed in world thread to be safe
-        processing = GetChatPacketProcessingType((ChatPacketHeader*)newPacket->contents());
+    {
+        // Socket-less bot sessions are not registered in World::m_sessions,
+        // so PACKET_PROCESS_DB_QUERY would never be drained for them.
+        // Their in-world Player is updated through Map::Update(), therefore
+        // synthetic bot chat must use the map processing queue instead.
+        if (!m_Socket)
+            processing = PACKET_PROCESS_MAP;
+        else
+            processing = GetChatPacketProcessingType((ChatPacketHeader*)newPacket->contents());
+    }
     else
     {
         OpcodeHandler const& opHandle = opcodeTable[newPacket->GetOpcode()];
@@ -444,9 +453,17 @@ bool WorldSession::Update(PacketFilter& updater)
 
 bool WorldSession::CanProcessPackets() const
 {
-    // sPlayerBotMgr.IsChatBot() clause removed — Penqle stub binned. cmangos's
-    // bot system uses isRealPlayer() guards in instead.
-    return (m_Socket && !m_Socket->IsClosed());
+    if (m_Socket && !m_Socket->IsClosed())
+        return true;
+
+    // Bot sessions deliberately have no socket, but still need their synthetic
+    // incoming packets (for example LLM-generated CMSG_MESSAGECHAT) processed.
+    // WorldSession's null-socket constructor uses "<BOT>"; some bot creation
+    // paths also use "disconnected/bot" as the explicit remote address marker.
+    // Real disconnected player sessions retain their actual remote IP and
+    // therefore remain blocked here.
+    return GetRemoteAddress() == "<BOT>" ||
+           GetRemoteAddress() == "disconnected/bot";
 }
 
 void WorldSession::ProcessPackets(PacketFilter& updater)

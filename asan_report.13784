@@ -1,0 +1,108 @@
+==13784==AddressSanitizer: WARNING: unexpected format specifier in printf interceptor: %" (reported once per process)
+=================================================================
+==13784==ERROR: AddressSanitizer: heap-use-after-free on address 0x52700298fbc8 at pc 0x63a76e5e0b87 bp 0x77eed81b3350 sp 0x77eed81b3340
+READ of size 8 at 0x52700298fbc8 thread T1381
+    #0 0x63a76e5e0b86 in Player::GetModuleSlot(unsigned char) const /home/hans/tortoise-wow/src/game/Objects/Player.h:2495
+    #1 0x63a76e662b79 in PlayerbotAI::HasRealPlayerMaster() /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/PlayerbotAI.h:664
+    #2 0x63a76e632366 in PlayerbotAI::HandleBotOutgoingPacket(WorldPacket const&) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/PlayerbotAI.cpp:1996
+    #3 0x63a76e7981b0 in PlayerbotServerScript::CanPacketSend(WorldSession*, WorldPacket const&) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/PlayerbotScripts.cpp:85
+    #4 0x63a76cfb2764 in operator() /home/hans/tortoise-wow/src/game/WorldSession.cpp:181
+    #5 0x63a76cfb5c76 in ForEachEnabledHookWithReturn<WorldSession::SendPacket(const WorldPacket*)::<lambda(ServerScript*)> > /home/hans/tortoise-wow/src/game/ScriptMgr.h:1830
+    #6 0x63a76cfb6907 in WorldSession::SendPacket(WorldPacket const*) /home/hans/tortoise-wow/src/game/WorldSession.cpp:179
+    #7 0x63a76dd04fc4 in Channel::SendToAll(WorldPacket*, ObjectGuid) /home/hans/tortoise-wow/src/game/Chat/Channel.cpp:823
+    #8 0x63a76dd0b2c5 in Channel::Say(ObjectGuid, char const*, unsigned int, bool) /home/hans/tortoise-wow/src/game/Chat/Channel.cpp:711
+    #9 0x63a76e612306 in PlayerbotAI::SayToWorld(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/PlayerbotAI.cpp:3368
+    #10 0x63a76f1132c1 in ai::ChatReplyAction::SendGeneralResponse(Player*, ChatChannelSource, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/strategy/actions/SayAction.cpp:984
+    #11 0x63a76f12d99d in ai::ChatReplyAction::ChatReplyDo(Player*, unsigned int, unsigned int, unsigned int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/strategy/actions/SayAction.cpp:671
+    #12 0x63a76e63d5f7 in PlayerbotAI::UpdateAIInternal(unsigned int, bool) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/PlayerbotAI.cpp:1384
+    #13 0x63a76e64a034 in PlayerbotAI::UpdateAI(unsigned int, bool) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/PlayerbotAI.cpp:696
+    #14 0x63a76e7984c7 in PlayerbotPlayerScript::OnUpdate(Player*, unsigned int) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/PlayerbotScripts.cpp:250
+    #15 0x63a76d66024c in ForEachEnabledHook<Player::Update(uint32, uint32)::<lambda(PlayerScript*)> > /home/hans/tortoise-wow/src/game/ScriptMgr.h:1810
+    #16 0x63a76d7056fb in Player::Update(unsigned int, unsigned int) /home/hans/tortoise-wow/src/game/Objects/Player.cpp:2005
+    #17 0x63a76d3fd065 in WorldObject::UpdateHelper::UpdateRealTime(unsigned int, unsigned int) /home/hans/tortoise-wow/src/game/Objects/Object.h:808
+    #18 0x63a76d412c46 in Map::UpdatePlayers() /home/hans/tortoise-wow/src/game/Maps/Map.cpp:910
+    #19 0x63a76d42bc93 in Map::Update(unsigned int) /home/hans/tortoise-wow/src/game/Maps/Map.cpp:967
+    #20 0x63a76d40b4fb in Map::DoUpdate(unsigned int) /home/hans/tortoise-wow/src/game/Maps/Map.cpp:927
+    #21 0x63a76e3d3887 in ThreadPool::worker_sq::doWork() /home/hans/tortoise-wow/src/shared/ThreadPool.cpp:255
+    #22 0x63a76e3d4483 in ThreadPool::worker::loop() /home/hans/tortoise-wow/src/shared/ThreadPool.cpp:199
+    #23 0x63a76e3d6553 in ThreadPool::worker::loop_wrapper() /home/hans/tortoise-wow/src/shared/ThreadPool.cpp:133
+    #24 0x77ef46adc252  (/lib/x86_64-linux-gnu/libstdc++.so.6+0xdc252)
+    #25 0x77ef46694a82 in start_thread nptl/pthread_create.c:442
+    #26 0x77ef4672688f  (/lib/x86_64-linux-gnu/libc.so.6+0x12688f)
+
+0x52700298fbc8 is located 13000 bytes inside of 13016-byte region [0x52700298c900,0x52700298fbd8)
+freed by thread T46 here:
+    #0 0x77ef47ec1540 in operator delete(void*, unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:164
+    #1 0x63a76d42efc7 in Map::Remove(Player*, bool) /home/hans/tortoise-wow/src/game/Maps/Map.cpp:1295
+    #2 0x63a76cfbd08f in WorldSession::LogoutPlayer(bool) /home/hans/tortoise-wow/src/game/WorldSession.cpp:860
+    #3 0x63a76e75d8fb in PlayerbotHolder::LogoutPlayerBot(unsigned int, bool, bool) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/PlayerbotMgr.cpp:635
+    #4 0x63a76e88bba4 in RandomPlayerbotMgr::ProcessBot(unsigned int) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/RandomPlayerbotMgr.cpp:2361
+    #5 0x63a76e8993cd in RandomPlayerbotMgr::UpdateAIInternal(unsigned int, bool) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/RandomPlayerbotMgr.cpp:738
+    #6 0x63a76e6aa001 in PlayerbotAIBase::UpdateAI(unsigned int) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/PlayerbotAIBase.cpp:29
+    #7 0x63a76e799b83 in PlayerbotWorldScript::OnUpdate(unsigned int) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/PlayerbotScripts.cpp:53
+    #8 0x63a76ceffc6c in ForEachEnabledHook<World::Update(uint32)::<lambda(WorldScript*)> > /home/hans/tortoise-wow/src/game/ScriptMgr.h:1810
+    #9 0x63a76cf2c7e1 in World::Update(unsigned int) /home/hans/tortoise-wow/src/game/World.cpp:3104
+    #10 0x63a76cc347f2 in WorldRunnable::operator()() /home/hans/tortoise-wow/src/mangosd/WorldRunnable.cpp:99
+    #11 0x77ef46adc252  (/lib/x86_64-linux-gnu/libstdc++.so.6+0xdc252)
+
+previously allocated by thread T46 here:
+    #0 0x77ef47ec0498 in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:95
+    #1 0x63a76d317f59 in WorldSession::HandlePlayerLogin(LoginQueryHolder*) /home/hans/tortoise-wow/src/game/Handlers/CharacterHandler.cpp:684
+    #2 0x63a76e7606e7 in PlayerbotHolder::HandlePlayerBotLoginCallback(QueryResult*, SqlQueryHolder*) /home/hans/tortoise-wow/modules/mod-playerbots/src/playerbot/PlayerbotMgr.cpp:221
+    #3 0x63a76e4292ac in SqlResultQueue::Update(unsigned int) /home/hans/tortoise-wow/src/shared/Database/SqlOperations.cpp:137
+    #4 0x63a76cef6627 in World::UpdateResultQueue() /home/hans/tortoise-wow/src/game/World.cpp:3962
+    #5 0x63a76cf2bc9c in World::Update(unsigned int) /home/hans/tortoise-wow/src/game/World.cpp:2807
+    #6 0x63a76cc347f2 in WorldRunnable::operator()() /home/hans/tortoise-wow/src/mangosd/WorldRunnable.cpp:99
+    #7 0x77ef46adc252  (/lib/x86_64-linux-gnu/libstdc++.so.6+0xdc252)
+
+Thread T1381 created by T46 here:
+    #0 0x77ef47e4af85 in __interceptor_pthread_create ../../../../src/libsanitizer/asan/asan_interceptors.cpp:207
+    #1 0x77ef46adc328 in std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) (/lib/x86_64-linux-gnu/libstdc++.so.6+0xdc328)
+    #2 0x63a76e3d5f40 in ThreadPool::worker::worker(ThreadPool*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, int, ThreadPool::ErrorHandling) /home/hans/tortoise-wow/src/shared/ThreadPool.cpp:117
+    #3 0x63a76e3d62df in ThreadPool::worker_sq::worker_sq(ThreadPool*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, int, ThreadPool::ErrorHandling) /home/hans/tortoise-wow/src/shared/ThreadPool.cpp:246
+    #4 0x63a76d45cfdd in void ThreadPool::start<ThreadPool::worker_sq>() /home/hans/tortoise-wow/src/shared/ThreadPool.h:101
+    #5 0x63a76d4779d4 in MapManager::Update(unsigned int) /home/hans/tortoise-wow/src/game/Maps/MapManager.cpp:391
+    #6 0x63a76cf2bb47 in World::Update(unsigned int) /home/hans/tortoise-wow/src/game/World.cpp:2762
+    #7 0x63a76cc347f2 in WorldRunnable::operator()() /home/hans/tortoise-wow/src/mangosd/WorldRunnable.cpp:99
+    #8 0x77ef46adc252  (/lib/x86_64-linux-gnu/libstdc++.so.6+0xdc252)
+
+Thread T46 created by T0 here:
+    #0 0x77ef47e4af85 in __interceptor_pthread_create ../../../../src/libsanitizer/asan/asan_interceptors.cpp:207
+    #1 0x77ef46adc328 in std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) (/lib/x86_64-linux-gnu/libstdc++.so.6+0xdc328)
+    #2 0x63a76cb7c529 in Master::Run() /home/hans/tortoise-wow/src/mangosd/Master.cpp:547
+    #3 0x63a76c4cdf12 in main /home/hans/tortoise-wow/src/mangosd/Main.cpp:226
+    #4 0x77ef46629d8f in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58
+
+SUMMARY: AddressSanitizer: heap-use-after-free /home/hans/tortoise-wow/src/game/Objects/Player.h:2495 in Player::GetModuleSlot(unsigned char) const
+Shadow bytes around the buggy address:
+  0x0a4e80529f20: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x0a4e80529f30: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x0a4e80529f40: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x0a4e80529f50: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x0a4e80529f60: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+=>0x0a4e80529f70: fd fd fd fd fd fd fd fd fd[fd]fd fa fa fa fa fa
+  0x0a4e80529f80: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0a4e80529f90: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0a4e80529fa0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0a4e80529fb0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0a4e80529fc0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==13784==ABORTING

@@ -26,8 +26,8 @@ struct ChatReplyData
 
 struct ChatQueuedReply
 {
-    ChatQueuedReply() : m_type(0), m_guid1(0), m_guid2(0), m_msg(), m_chanName(), m_name(), m_time(0) {}
-    ChatQueuedReply(uint32 type, uint32 guid1, uint32 guid2, std::string msg, std::string chanName, std::string name, time_t time) : m_type(type), m_guid1(guid1), m_guid2(guid2), m_msg(msg), m_chanName(chanName), m_name(name), m_time(time) {}
+    ChatQueuedReply() : m_type(0), m_guid1(0), m_guid2(0), m_msg(), m_chanName(), m_name(), m_time(0), m_allowReply(true) {}
+    ChatQueuedReply(uint32 type, uint32 guid1, uint32 guid2, std::string msg, std::string chanName, std::string name, time_t time, bool allowReply = true) : m_type(type), m_guid1(guid1), m_guid2(guid2), m_msg(msg), m_chanName(chanName), m_name(name), m_time(time), m_allowReply(allowReply) {}
     uint32 m_type;
     uint32 m_guid1;
     uint32 m_guid2;
@@ -35,6 +35,7 @@ struct ChatQueuedReply
     std::string m_chanName;
     std::string m_name;
     time_t m_time;
+    bool m_allowReply;   // false = context-only, never routed to ChatReplyDo's reply path
 };
 
 enum ChatReplyType

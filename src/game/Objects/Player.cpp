@@ -19874,6 +19874,9 @@ void Player::DropModCharge(SpellModifier* mod, Spell* spell)
             mod->charges = -1;
 
         spell->m_appliedMods.push_back(mod);
+        // Record the spellId by value now, while mod is still guaranteed
+        // alive -- see Spell::m_consumedModSpellIds.
+        spell->m_consumedModSpellIds.push_back(mod->spellId);
     }
 }
 

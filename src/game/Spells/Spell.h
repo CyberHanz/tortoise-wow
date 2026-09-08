@@ -535,6 +535,14 @@ class Spell
 
         bool HasModifierApplied(SpellModifier* mod);
         std::list<SpellModifier*> m_appliedMods;
+        // By-value record of the spellId of every SpellModifier this cast
+        // consumed a charge of (see Player::DropModCharge). Populated at the
+        // exact moment of consumption, independent of the SpellModifier
+        // object's own lifetime -- safe to read from OnFinish even if the
+        // modifier (and its owning aura) has since been removed by an
+        // unrelated path (e.g. aura stack-replacement). Prefer this over
+        // dereferencing m_appliedMods pointers for anything read in OnFinish.
+        std::vector<uint32> m_consumedModSpellIds;
 
         SpellSchoolMask m_spellSchoolMask;                  // Spell school (can be overwrite for some spells (wand shoot for example)
 

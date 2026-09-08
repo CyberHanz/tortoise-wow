@@ -4,6 +4,7 @@
 #include "playerbot/PerformanceMonitor.h"
 #include <stdarg.h>
 #include <iomanip>
+#include <functional>
 
 #include "playerbot/AiFactory.h"
 
@@ -27,6 +28,8 @@
 #include "Spells/SpellAuras.h"
 #include "Spells/SpellMgr.h"
 #include "PlayerbotDbStore.h"
+#include "PlayerbotMemoryStore.h"
+#include <cstdlib>
 #include "strategy/values/PositionValue.h"
 #include "playerbot/ServerFacade.h"
 #include "playerbot/TravelMgr.h"
@@ -1381,7 +1384,15 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
                 chatReplies.pop();
                 continue;
             }
-            ChatReplyAction::ChatReplyDo(bot, holder.m_type, holder.m_guid1, holder.m_guid2, holder.m_msg, holder.m_chanName, holder.m_name);
+            // Option-A party-context patch: allowReply=false entries (from
+            // QueueChatContext()) are recorded into llmContext only, never
+            // answered -- see ChatReplyAction::AppendPartyContextOnly(). Both
+            // branches run here, on the bot's own tick thread, exactly like
+            // the pre-existing ChatReplyDo() call always has.
+            if (holder.m_allowReply)
+                ChatReplyAction::ChatReplyDo(bot, holder.m_type, holder.m_guid1, holder.m_guid2, holder.m_msg, holder.m_chanName, holder.m_name);
+            else
+                ChatReplyAction::AppendPartyContextOnly(bot, holder.m_type, holder.m_guid1, holder.m_msg, holder.m_chanName, holder.m_name);
             chatReplies.pop();
         }
 
@@ -1390,6 +1401,7 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
             chatReplies.push(*i);
         }
     }
+
     // logout if logout timer is ready or if instant logout is possible
     if (bot->IsStunnedByLogout() || bot->GetSession()->isLogingOut())
     {
@@ -1484,6 +1496,10 @@ void PlayerbotAI::HandleTeleportAck()
 
 void PlayerbotAI::Reset(bool full)
 {
+    // Reset can run outside UpdateAI, e.g. teleport processing, so cached
+    // master must be revalidated before use.
+    RevalidateMasterPointer();
+
     AiObjectContext* context = aiObjectContext;
 
     if (bot->IsTaxiFlying())
@@ -1861,7 +1877,37 @@ void PlayerbotAI::HandleBotOutgoingPacket(const WorldPacket& packet)
             if (guid1.IsEmpty() || p.size() > 0x1000)
                 return;
 
-            p >> textLen >> message >> chatTag;
+            // Crash fix (2026-09-07): ChatHandler::BuildChatPacket() (Chat.cpp)
+            // writes msgtype/language/guid(s)/chanName unconditionally, but then
+            // does `if (messageFinal.empty()) return;` BEFORE ever writing
+            // textLen/message/chatTag -- an empty bot->Say()/Yell()/etc. (e.g.
+            // AcceptQuest()'s outputMessage staying "" on a fallthrough path)
+            // therefore produces a packet that ends right here. Proven live for
+            // CHAT_MSG_SAY: pos==size==21, exactly msgtype(1)+lang(4)+guid1(8)+
+            // guid2(8), nothing after. That is a valid empty chat message, not a
+            // corrupt packet -- bail out the same way the guard above already
+            // does, instead of blindly reading a uint32 that was never written
+            // (this used to crash with a ByteBufferException here).
+            if (p.rpos() >= p.size())
+                return;
+
+            // Not empty, but possibly truncated/malformed: make sure a full
+            // textLen field is actually present before reading it.
+            if (p.rpos() + sizeof(uint32) > p.size())
+                return;
+
+            p >> textLen;
+
+            // textLen is BuildChatPacket()'s own declared length for the
+            // message-plus-terminator that follows (data << uint32(len+1);
+            // data << messageFinal;), immediately followed by one chatTag byte.
+            // Trust that declared length only after confirming that many bytes
+            // actually remain -- this protects the message/chatTag reads too,
+            // for a packet that claims more than it actually contains.
+            if (p.rpos() + textLen + sizeof(uint8) > p.size())
+                return;
+
+            p >> message >> chatTag;
 #endif
 #ifdef MANGOSBOT_ONE
             p >> guid1 >> unused;
@@ -1879,7 +1925,24 @@ void PlayerbotAI::HandleBotOutgoingPacket(const WorldPacket& packet)
             case CHAT_MSG_WHISPER:
             case CHAT_MSG_GUILD:
                 p >> guid2;
-                p >> textLen >> message >> chatTag;
+
+                // Crash fix (2026-09-07): same BuildChatPacket() behaviour as
+                // the MANGOSBOT_ZERO branch above (see the comment there) --
+                // textLen/message/chatTag are omitted entirely for an empty
+                // outgoing message, and never longer than their own declared
+                // length. Guard both instead of reading blindly.
+                if (p.rpos() >= p.size())
+                    return;
+
+                if (p.rpos() + sizeof(uint32) > p.size())
+                    return;
+
+                p >> textLen;
+
+                if (p.rpos() + textLen + sizeof(uint8) > p.size())
+                    return;
+
+                p >> message >> chatTag;
                 break;
             default:
                 break;
@@ -1908,7 +1971,24 @@ void PlayerbotAI::HandleBotOutgoingPacket(const WorldPacket& packet)
             case CHAT_MSG_WHISPER:
             case CHAT_MSG_GUILD:
                 p >> guid2;
-                p >> textLen >> message >> chatTag;
+
+                // Crash fix (2026-09-07): same BuildChatPacket() behaviour as
+                // the MANGOSBOT_ZERO branch above (see the comment there) --
+                // textLen/message/chatTag are omitted entirely for an empty
+                // outgoing message, and never longer than their own declared
+                // length. Guard both instead of reading blindly.
+                if (p.rpos() >= p.size())
+                    return;
+
+                if (p.rpos() + sizeof(uint32) > p.size())
+                    return;
+
+                p >> textLen;
+
+                if (p.rpos() + textLen + sizeof(uint8) > p.size())
+                    return;
+
+                p >> message >> chatTag;
                 break;
             default:
                 break;
@@ -1992,10 +2072,155 @@ void PlayerbotAI::HandleBotOutgoingPacket(const WorldPacket& packet)
                     }
                 }
 
-                bool isMentioned = message.find(bot->GetName()) != std::string::npos;
+                bool isMentioned = ChatHelper::isNameMentioned(message, bot->GetName());
                 
 
                 ChatChannelSource chatChannelSource = GetChatChannelSource(bot, msgtype, chanName);
+
+                // Option-A party-context patch (2026-09-06, corrected): this
+                // shortcut must NOT be a blanket bypass of the reply gauntlet
+                // for every free-bot-sourced party message -- only for the
+                // ones that could never produce a reply anyway. Whether a
+                // reply is even possible for a bot-authored message is
+                // decided by AiPlayerbot.LLMBotToBotChatChance, checked at
+                // ChatReplyAction::ChatReplyDo()'s `player != bot &&
+                // (IsRealPlayer(player) || (llmBotToBotChatChance && roll))`
+                // condition in SayAction.cpp. With the live value of 0, that
+                // condition can never be true for a bot sender, so skipping
+                // straight to context-only here changes nothing about reply
+                // eligibility -- it only rescues the message from being
+                // silently dropped, without a trace, by the free-bot
+                // spam/reply throttles below (originally lines 2113 ff.).
+                // The `&& !sPlayerbotAIConfig.llmBotToBotChatChance` guard is
+                // what keeps this safe if that config is ever raised above 0
+                // in the future: this shortcut then no longer fires, and
+                // free-bot-sourced party messages fall through to the
+                // ORIGINAL, completely unmodified gauntlet below (including
+                // the harsh urand() spam throttles), exactly as before this
+                // patch existed -- so a bot can still end up replying to
+                // another bot exactly as often as AiPlayerbot.LLMBotToBotChatChance
+                // and those throttles together already allowed, unchanged.
+                // Scope: party chat only (SRC_PARTY) -- guild/world/say/raid/
+                // whisper handling is untouched. QueueChatContext() only
+                // pushes onto the existing mutex-protected chatReplies queue;
+                // it never touches aiObjectContext from this thread (see
+                // PlayerbotAI::HandleBotOutgoingPacket(), which this code is
+                // part of, and which may run off the map/tick thread per the
+                // CMSG_MESSAGECHAT / PACKET_PROCESS_DB_QUERY finding from the
+                // ASAN investigation) -- the actual llmContext write happens
+                // later, in ChatReplyAction::AppendPartyContextOnly(), called
+                // only from UpdateAIInternal() on the bot's own tick thread.
+                if (isAiChat && isFromFreeBot && chatChannelSource == ChatChannelSource::SRC_PARTY
+                    && !sPlayerbotAIConfig.llmBotToBotChatChance)
+                {
+                    QueueChatContext(msgtype, guid1, message, chanName, name);
+                    return;
+                }
+
+                // Addressing-suppression is scoped to party chat only. CHAT_MSG_PARTY
+                // (and, on builds where it exists, CHAT_MSG_PARTY_LEADER) are the only
+                // message types GetChatChannelSource() maps to SRC_PARTY, so checking
+                // SRC_PARTY here already covers both without repeating the ifdef.
+                // Guild/say/yell/whisper/channel chat are intentionally left untouched.
+                // Raid chat (SRC_RAID) is out of scope here too -- CHAT_MSG_RAID is
+                // already filtered out earlier in this function and never reaches this
+                // point today.
+                std::vector<ObjectGuid> namedOtherMemberGuids;
+                if (isAiChat && !isFromFreeBot && !isMentioned && chatChannelSource == ChatChannelSource::SRC_PARTY)
+                {
+                    if (Group* group = bot->GetGroup())
+                    {
+                        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                        {
+                            Player* member = ref->getSource();
+                            if (!member || member == bot)
+                                continue;
+
+                            if (ChatHelper::isNameMentioned(message, member->GetName()))
+                                namedOtherMemberGuids.push_back(member->GetObjectGuid());
+                        }
+                    }
+                }
+
+                ObjectGuid addressedGuid;
+                bool wonInterjection = false;
+
+                // Exactly one other party member was explicitly addressed: this bot
+                // (itself not named) may be selected to interject as a third party.
+                // Multiple named members falls through unchanged and is suppressed
+                // further down below, same as the old otherMemberMentioned behavior.
+                if (namedOtherMemberGuids.size() == 1)
+                {
+                    addressedGuid = namedOtherMemberGuids.front();
+
+                    // Identical candidate set for every bot evaluating this message:
+                    // all machine-controlled group members, INCLUDING this bot itself,
+                    // excluding only the sender and the explicitly addressed member.
+                    // No cross-bot HasStrategy() or other mutable strategy reads.
+                    std::vector<ObjectGuid> candidateGuids;
+                    if (Group* group = bot->GetGroup())
+                    {
+                        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                        {
+                            Player* member = ref->getSource();
+                            if (!member || !GetBotAI(member))
+                                continue;
+                            if (member->GetObjectGuid() == guid1 || member->GetObjectGuid() == addressedGuid)
+                                continue;
+                            candidateGuids.push_back(member->GetObjectGuid());
+                        }
+                    }
+
+                    if (!candidateGuids.empty())
+                    {
+                        // Captured once and reused for both the gate and the winner
+                        // hash below -- never re-queried mid-calculation.
+                        // Group::BroadcastPacket() dispatches to every group member
+                        // synchronously on the same thread, so in practice every bot
+                        // evaluating this message sees the same second here. That is
+                        // a pragmatic Phase-1 property, not a mathematical guarantee.
+                        const time_t messageEpoch = time(nullptr);
+
+                        std::string gateKey = std::to_string(guid1.GetCounter()) + "|" + message + "|" +
+                            std::to_string(static_cast<uint32>(chatChannelSource)) + "|" +
+                            std::to_string(messageEpoch) + "|gate";
+                        uint32 gateRoll = static_cast<uint32>(std::hash<std::string>()(gateKey) % 100);
+
+                        if (gateRoll < sPlayerbotAIConfig.partyInterjectionChance)
+                        {
+                            ObjectGuid winnerGuid = candidateGuids.front();
+                            std::string firstWinnerKey = std::to_string(guid1.GetCounter()) + "|" + message + "|" +
+                                std::to_string(static_cast<uint32>(chatChannelSource)) + "|" +
+                                std::to_string(messageEpoch) + "|" + std::to_string(winnerGuid.GetCounter()) + "|winner";
+                            uint64 bestScore = std::hash<std::string>()(firstWinnerKey);
+
+                            for (size_t i = 1; i < candidateGuids.size(); ++i)
+                            {
+                                ObjectGuid const& candidate = candidateGuids[i];
+                                std::string winnerKey = std::to_string(guid1.GetCounter()) + "|" + message + "|" +
+                                    std::to_string(static_cast<uint32>(chatChannelSource)) + "|" +
+                                    std::to_string(messageEpoch) + "|" + std::to_string(candidate.GetCounter()) + "|winner";
+                                uint64 score = std::hash<std::string>()(winnerKey);
+                                if (score > bestScore)
+                                {
+                                    bestScore = score;
+                                    winnerGuid = candidate;
+                                }
+                            }
+
+                            if (winnerGuid == bot->GetObjectGuid())
+                            {
+                                // This-bot-only cooldown -- never inspects another bot's state.
+                                time_t lastInterjection = GetAiObjectContext()->GetValue<time_t>("last said", "interjection")->Get();
+                                if (time(0) >= lastInterjection)
+                                {
+                                    GetAiObjectContext()->GetValue<time_t>("last said", "interjection")->Set(time(0) + urand(45, 90));
+                                    wonInterjection = true;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if (!isAiChat || isFromFreeBot)
                 {
@@ -2050,8 +2275,29 @@ void PlayerbotAI::HandleBotOutgoingPacket(const WorldPacket& packet)
                     }
                 }
 
-                MANGOS_ASSERT(!message.empty());     
-                QueueChatResponse(msgtype, guid1, ObjectGuid(), message, chanName, name, isAiChat);
+                // Multiple-other-addressee case lands here too (namedOtherMemberGuids
+                // stayed non-empty, wonInterjection stays false), unconditionally
+                // suppressed. Directly addressed bots (isMentioned == true) never
+                // populated namedOtherMemberGuids and are unaffected.
+                if (!namedOtherMemberGuids.empty() && !wonInterjection)
+                {
+                    // Option-A party-context patch (2026-09-06): `bot` still
+                    // isn't allowed to REPLY here (that verdict -- named
+                    // someone else, didn't win the interjection -- is
+                    // unchanged), but the message was sent by a real party
+                    // member (isFromFreeBot messages never reach this point,
+                    // see the free-bot short-circuit above) and named another
+                    // party member explicitly, so record it as party context
+                    // instead of dropping it without a trace, exactly like
+                    // the free-bot case above. Same thread-safe queue, same
+                    // reasoning: QueueChatContext() never touches
+                    // aiObjectContext from this thread.
+                    QueueChatContext(msgtype, guid1, message, chanName, name);
+                    return;
+                }
+
+                MANGOS_ASSERT(!message.empty());
+                QueueChatResponse(msgtype, guid1, wonInterjection ? addressedGuid : ObjectGuid(), message, chanName, name, isAiChat);
                 GetAiObjectContext()->GetValue<time_t>("last said", "chat")->Set(time(0) + urand(5, 25));
 
                 return;
@@ -3761,6 +4007,19 @@ bool PlayerbotAI::Whisper(std::string msg, std::string receiverName, bool likePl
 bool PlayerbotAI::TellPlayerNoFacing(Player* player, std::string text, PlayerbotSecurityLevel securityLevel, bool isPrivate, bool noRepeat, bool ignoreSilent)
 {
     if(!player)
+        return false;
+
+    // Crash fix (2026-09-07): a caller can reach here with an unset/empty
+    // `text` (e.g. QuestAction::AcceptQuest() leaving outputMessage == ""
+    // on a fallthrough path -- see the comment there). Forwarding that
+    // empty string down to bot->Say()/SayToParty()/etc. used to produce a
+    // packet ChatHandler::BuildChatPacket() writes only a truncated header
+    // for, which then crashed HandleBotOutgoingPacket() with a
+    // ByteBufferException (see the fix there). One central guard here
+    // covers every current and future Tell*/Say* caller, not just
+    // AcceptQuest -- and also avoids sending a silent, empty chat bubble
+    // to real players.
+    if (text.empty())
         return false;
 
     if (!ignoreSilent && HasStrategy("silent", BotState::BOT_STATE_NON_COMBAT))
@@ -6903,6 +7162,45 @@ std::string PlayerbotAI::HandleRemoteCommand(std::string command)
     {
         return GetAiObjectContext()->FormatValues();
     }
+    // Phase-1 persistent memory diagnostic. Two forms, both routed here
+    // unchanged by RandomPlayerbotMgr::HandleRemoteCommand() (which only
+    // splits the request on its FIRST comma into <command>,<bot_guid>, so a
+    // subject guid has to travel inside the command token itself):
+    //   "memory,<bot_guid>"                -> command == "memory": every
+    //       active memory this bot has, for any subject.
+    //   "memory:<subject_guid>,<bot_guid>" -> command == "memory:<digits>":
+    //       only that (bot, subject) pair's active memories.
+    // Read-only: goes through PlayerbotMemoryStore's normal cached
+    // GetActive()/GetActiveForSubject() path (mutex-protected), same as
+    // every other value this command server can already report -- see
+    // PlayerbotCommandServer.cpp, which runs each connection on its own
+    // detached thread, outside the map-update/tick-thread pool. No write
+    // path is reachable from here.
+    else if (command == "memory" || command.rfind("memory:", 0) == 0)
+    {
+        uint64 botGuid = bot->GetObjectGuid().GetRawValue();
+
+        std::vector<PlayerbotMemoryEntry> memories;
+        if (command.size() > 7)
+        {
+            uint64 subjectGuid = std::strtoull(command.substr(7).c_str(), nullptr, 10);
+            memories = sPlayerbotMemoryStore.GetActiveForSubject(botGuid, subjectGuid);
+        }
+        else
+        {
+            memories = sPlayerbotMemoryStore.GetActive(botGuid);
+        }
+
+        if (memories.empty())
+            return "no active memories";
+
+        std::ostringstream out;
+        for (auto const& mem : memories)
+        {
+            out << "[subject=" << mem.subjectGuid << "] " << mem.factOriginal << "|";
+        }
+        return out.str();
+    }
     else if (command == "travel")
     {
         std::ostringstream out;
@@ -8824,6 +9122,22 @@ void PlayerbotAI::QueueChatResponse(uint32 msgType, ObjectGuid guid1, ObjectGuid
 {
     std::scoped_lock lock(chatRepliesMutex);
     chatReplies.push(ChatQueuedReply(msgType, guid1.GetCounter(), guid2.GetCounter(), message, chanName, name, time(0) + (noDelay ? 0 : urand(inCombat ? 15 : 10, inCombat ? 30 : 20))));
+}
+
+// Option-A party-context patch: pushes onto the exact same mutex-protected
+// chatReplies queue as QueueChatResponse() above -- just with allowReply=false
+// and no artificial reply delay, since nothing will ever be spoken for this
+// entry. UpdateAIInternal() dequeues it on the bot's own tick thread and
+// routes it to ChatReplyAction::AppendPartyContextOnly() instead of
+// ChatReplyAction::ChatReplyDo(). Deliberately does not touch
+// aiObjectContext/AI_VALUE/SET_AI_VALUE itself -- same reasoning as
+// QueueChatResponse() above (see PlayerbotAI::HandleBotOutgoingPacket(),
+// which may run off the map/tick thread per the CMSG_MESSAGECHAT /
+// PACKET_PROCESS_DB_QUERY finding from the ASAN investigation).
+void PlayerbotAI::QueueChatContext(uint32 msgType, ObjectGuid guid1, std::string message, std::string chanName, std::string name)
+{
+    std::scoped_lock lock(chatRepliesMutex);
+    chatReplies.push(ChatQueuedReply(msgType, guid1.GetCounter(), 0, message, chanName, name, time(0), false));
 }
 
 bool PlayerbotAI::PlayAttackEmote(float chanceMultiplier)

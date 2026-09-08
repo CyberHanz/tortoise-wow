@@ -8,6 +8,8 @@
 #include <regex>
 #include <boost/algorithm/string.hpp>
 #include "playerbot/PlayerbotLLMInterface.h"
+#include "playerbot/PlayerbotMemoryStore.h"
+#include "playerbot/ChatHelper.h"
 
 using namespace ai;
 
@@ -149,6 +151,7 @@ void ChatReplyAction::GetAIChatPlaceholders(std::map<std::string, std::string>& 
     placeholders["<" + preFix + " level>"] = std::to_string(unit->GetLevel());
     placeholders["<" + preFix + " class>"] = ChatHelper::formatClass(unit->getClass());
     placeholders["<" + preFix + " race>"] = ChatHelper::formatRace(unit->getRace());
+    placeholders["<" + preFix + " life state>"] = ChatHelper::formatLifeState(unit);
 
     FactionTemplateEntry const* factionTemplate = unit->GetFactionTemplateEntry();
     uint32 factionId = factionTemplate ? factionTemplate->faction : 0;
@@ -419,7 +422,7 @@ delayedPackets ChatReplyAction::LinesToPackets(const std::vector<std::string>& l
 }
 
 delayedPackets ChatReplyAction::GenerateResponsePackets(const std::string json
-    , const WorldPacket chatTemplate, const WorldPacket emoteTemplate, const WorldPacket systemTemplate, const std::string startPattern, const std::string endPattern, const std::string deletePattern, const std::string splitPattern, bool debug)
+    , const WorldPacket chatTemplate, const WorldPacket emoteTemplate, const WorldPacket systemTemplate, const std::string startPattern, const std::string endPattern, const std::string deletePattern, const std::string splitPattern, bool debug, const std::string& fallbackText)
 {
     std::vector<std::string> debugLines;
 
@@ -437,7 +440,19 @@ delayedPackets ChatReplyAction::GenerateResponsePackets(const std::string json
 
     delayedPackets packets, debugPackets;
 
-    packets = LinesToPackets(lines, chatTemplate, false, 200, emoteTemplate, timeDiff);
+    packets = LinesToPackets(lines, chatTemplate, false, 50, emoteTemplate, timeDiff);
+
+    // Runtime LLM-failure fallback (connection refused, timeout, HTTP/error
+    // status, or an empty/unparseable body all collapse to the same
+    // observable symptom here: zero non-empty reply lines survived
+    // ParseResponse()+LinesToPackets()). Only takes effect when the caller
+    // supplied a non-empty fallbackText -- currently only the Phase-1
+    // memory-command path does, so ordinary chat replies keep their
+    // existing silent-drop-on-failure behaviour unchanged. No second
+    // Generate() call, no retry -- this only formats already-known text
+    // through the same LinesToPackets() used for a normal reply.
+    if (packets.empty() && !fallbackText.empty())
+        packets = LinesToPackets({ fallbackText }, chatTemplate, false, 50, emoteTemplate, timeDiff);
 
     if (!debugLines.empty())
     {
@@ -446,6 +461,144 @@ delayedPackets ChatReplyAction::GenerateResponsePackets(const std::string json
     }
 
     return packets;
+}
+
+// Structural subject-context fix (2026-09-07). Pure label/formatting helpers
+// over data that already flows through ChatReplyDo()/AppendPartyContextOnly()
+// (type, chatChannelSource, chanName, guid1) -- neither function decides or
+// discovers channel identity; that is still entirely GetChatChannelSource()'s
+// and chanName's job. Only in scope: SAY/YELL/PARTY/GUILD and the named
+// CHAT_MSG_CHANNEL channels (General/Trade/LocalDefense/WorldDefense/
+// LookingForGroup/GuildRecruitment/World) -- these are the only sources that
+// reach ChatReplyDo() today (HandleBotOutgoingPacket()'s msgtype switch in
+// PlayerbotAI.cpp does not forward CHAT_MSG_RAID or CHAT_MSG_OFFICER, and
+// there is no SRC_OFFICER; an unrecognised custom channel resolves to
+// SRC_UNDEFINED, which ChatReplyDo()'s own gate below already excludes).
+// RAID/OFFICER/custom-channel support is a separate, deliberately deferred
+// follow-up -- not touched here.
+static std::string SubjectChannelPrefix(ChatChannelSource src)
+{
+    switch (src)
+    {
+    case ChatChannelSource::SRC_SAY:        return "SAY";
+    case ChatChannelSource::SRC_YELL:       return "YELL";
+    case ChatChannelSource::SRC_PARTY:      return "PARTY";
+    case ChatChannelSource::SRC_RAID:       return "RAID";       // not reachable today, see comment above
+    case ChatChannelSource::SRC_GUILD:      return "GUILD";
+    case ChatChannelSource::SRC_EMOTE:      return "EMOTE";
+    case ChatChannelSource::SRC_TEXT_EMOTE: return "TEXT_EMOTE";
+    default:
+        // Same numeric encoding the existing shared llmChannel key already
+        // uses (std::to_string(chatChannelSource)) -- no new mechanism, just
+        // no literal name for this case.
+        return std::to_string((int)src);
+    }
+}
+
+static std::string BuildSubjectKey(uint32 type, ChatChannelSource src, const std::string& chanName, uint32 guid1)
+{
+    if (type == CHAT_MSG_CHANNEL)
+    {
+        // A non-empty chanName is the real, per-instance channel identity
+        // (e.g. distinguishes "LocalDefense - Elwynn Forest" from
+        // "LocalDefense - Westfall", which both resolve to the same
+        // SRC_LOCAL_DEFENSE). An empty chanName here would be unusual, but
+        // must NOT silently collapse into "CHANNEL::<guid>" -- two different
+        // unnamed channels could then collide. Fall back to the numeric
+        // source identity instead, same disjoint-from-llmChannel reasoning
+        // as SubjectChannelPrefix()'s default case.
+        if (!chanName.empty())
+            return "CHANNEL:" + chanName + ":" + std::to_string(guid1);
+
+        return "CHANNELSRC:" + std::to_string((int)src) + ":" + std::to_string(guid1);
+    }
+
+    return SubjectChannelPrefix(src) + ":" + std::to_string(guid1);
+}
+
+// Ticket 2 (named-subject persistent memory, CONSERVATIEVE resolver): one
+// deduplicated candidate set (group members UNION this bot's own known
+// memory-subject GUIDs) for possessive-only subject matching. Deliberately
+// NOT staged (group-first, known-subjects-as-fallback) -- a bare-mentioned
+// online group member must never be allowed to block a possessive-marked
+// offline known-subject from being considered, and vice versa; both sources
+// feed one flat, GUID-deduped list before any matching happens.
+// No DB query, no realm-wide scan: GetActive() is the existing per-bot
+// mutex-protected cache (PlayerbotMemoryStore.h), and the group walk is the
+// same GetFirstMember()/getSource() pattern PlayerbotAI.cpp already uses for
+// namedOtherMemberGuids. Event-driven, per human chat turn only.
+struct MemorySubjectCandidate
+{
+    ObjectGuid guid;
+    std::string name;
+};
+
+static std::vector<MemorySubjectCandidate> BuildMemorySubjectCandidates(Player* bot)
+{
+    std::vector<MemorySubjectCandidate> candidates;
+    auto addCandidate = [&](ObjectGuid guid)
+    {
+        if (!guid || guid == bot->GetObjectGuid())
+            return; // bot itself is never a memory subject candidate
+
+        for (auto const& c : candidates)
+            if (c.guid == guid)
+                return; // already present -- dedupe by GUID
+
+        std::string resolvedName;
+        if (sObjectMgr.GetPlayerNameByGUID(guid, resolvedName) && !resolvedName.empty())
+            candidates.push_back({ guid, resolvedName });
+    };
+
+    if (Group* group = bot->GetGroup())
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            if (Player* member = ref->getSource())
+                addCandidate(member->GetObjectGuid());
+
+    for (auto const& mem : sPlayerbotMemoryStore.GetActive(bot->GetObjectGuid().GetRawValue()))
+        addCandidate(ObjectGuid(mem.subjectGuid));
+
+    return candidates;
+}
+
+// Ticket 2: the ONLY subject-switching signal in this first conservative
+// version is explicit possessive syntax "<Name>'s" / "<Name>'s" (straight
+// and curly apostrophe). Reuses ChatHelper::isNameMentioned() UNMODIFIED --
+// its existing alnum-boundary check already treats the apostrophe as a
+// boundary character, so composing "name + \"'s\"" as the match target is
+// enough; no new low-level string-matching logic. Bare-name matching and a
+// generic "van X" rule are deliberately NOT implemented here (the latter is
+// provenance-unsafe: "Wat vindt Dyona van Naomanda?" must keep subject=Dyona,
+// so a blanket "van <name>" rule would inject the wrong subject).
+enum class MemorySubjectResolution
+{
+    Default,    // no possessive marker found -- caller stays at current speaker
+    Resolved,   // exactly one unique possessive match -- switch to it
+    Ambiguous   // 2+ distinct possessive matches -- caller must skip the memory block entirely
+};
+
+static MemorySubjectResolution ResolveMemorySubject(const std::string& message,
+    const std::vector<MemorySubjectCandidate>& candidates, ObjectGuid& outGuid, std::string& outName)
+{
+    const MemorySubjectCandidate* match = nullptr;
+    for (auto const& c : candidates)
+    {
+        if (ChatHelper::isNameMentioned(message, c.name + "'s") ||
+            ChatHelper::isNameMentioned(message, c.name + "`s") ||
+            ChatHelper::isNameMentioned(message, c.name + "’s"))
+        {
+            if (match)
+                return MemorySubjectResolution::Ambiguous; // second distinct possessive candidate this turn
+            match = &c;
+        }
+    }
+
+    if (!match)
+        return MemorySubjectResolution::Default;
+
+    outGuid = match->guid;
+    outName = match->name;
+    return MemorySubjectResolution::Resolved;
 }
 
 void ChatReplyAction::ChatReplyDo(Player* bot, uint32 type, uint32 guid1, uint32 guid2, std::string msg, std::string chanName, std::string name)
@@ -481,6 +634,24 @@ void ChatReplyAction::ChatReplyDo(Player* bot, uint32 type, uint32 guid1, uint32
     }
 
     ChatChannelSource chatChannelSource = GetBotAI(bot)->GetChatChannelSource(bot, type, chanName);
+
+    // Phase-1 persistent memory: checked before every other special-case
+    // handler below. HandleMemoryCommand() itself re-derives the sender from
+    // guid1, hard-requires IsRealPlayer(sender) == true, and requires the
+    // message's leading vocative to name THIS bot specifically (see
+    // ChatHelper::detectMemoryTrigger()'s addressedName) before it will touch
+    // PlayerbotMemoryStore -- so a bot-authored "onthoud"/"remember" string,
+    // and a command explicitly addressed to a DIFFERENT bot overheard on the
+    // same broadcast channel, can never write or delete a memory here.
+    // `memoryResult.handled == false` (not a memory command, rejected by
+    // IsRealPlayer, or addressed to a different bot) falls straight through
+    // to every handler below completely unchanged, exactly as before this
+    // existed. `memoryResult.handled == true` means the DB write/delete (or
+    // deliberate no-op) has ALREADY happened by this point -- what follows
+    // only decides how to phrase the confirmation, never whether to act; see
+    // the "<pre prompt>" directive further down and the fallback near the
+    // end of this function.
+    MemoryCommandResult memoryResult = HandleMemoryCommand(bot, chatChannelSource, msg, guid1, name);
 
     if ((boost::algorithm::istarts_with(msg, "LFG") || boost::algorithm::istarts_with(msg, "LFM"))
         && HandleLFGQuestsReply(bot, chatChannelSource, msg, name))
@@ -527,6 +698,22 @@ void ChatReplyAction::ChatReplyDo(Player* bot, uint32 type, uint32 guid1, uint32
 
         std::string llmContext = AI_VALUE(std::string, "manual string::llmcontext" + llmChannel);
 
+        // Structural subject-context fix. llmContext above is left completely
+        // alone -- same key, same reads/writes below -- kept for backward
+        // compatibility and any future party-ambient use. subjectContext is a
+        // SEPARATE local string, read from a disjoint key namespace ("manual
+        // string::llmcontext_subject", never "manual string::llmcontext"), so
+        // it can never collide with, or be accidentally saved over, llmContext.
+        // Gate: real player only (bot-authored messages must not populate a
+        // player's subject bucket) and non-whisper only (whisper's existing
+        // llmChannel==name key is already per-speaker-isolated, so a second
+        // bucket for it would be redundant -- left unchanged this round).
+        bool useSubjectContext = player && IsRealPlayer(player) && chatChannelSource != ChatChannelSource::SRC_WHISPER;
+        std::string subjectKey = BuildSubjectKey(type, chatChannelSource, chanName, guid1);
+        std::string subjectContext = useSubjectContext
+            ? AI_VALUE2(std::string, "manual string::llmcontext_subject", subjectKey)
+            : std::string();
+
         if (player)
         {
             std::string playerName = player->GetName();
@@ -538,6 +725,46 @@ void ChatReplyAction::ChatReplyDo(Player* bot, uint32 type, uint32 guid1, uint32
                 GetAIChatPlaceholders(placeholders, bot, player);
                 GetAIChatPlaceholders(placeholders, bot, "bot");
                 GetAIChatPlaceholders(placeholders, player, "other");
+
+                // --- Authoritative identity context (race/class/faction/life-state) ---
+                // Always present: these are fixed server-derived facts the model must
+                // never reinterpret, translate as creature type, or contradict.
+                placeholders["<authoritative identity context>"] =
+                    placeholders["<bot name>"] + ": race=" + placeholders["<bot race>"] +
+                    ", class=" + placeholders["<bot class>"] +
+                    ", faction=" + placeholders["<bot faction>"] +
+                    ", life-state=" + placeholders["<bot life state>"] + "; " +
+                    placeholders["<other name>"] + ": race=" + placeholders["<other race>"] +
+                    ", class=" + placeholders["<other class>"] +
+                    ", faction=" + placeholders["<other faction>"] +
+                    ", life-state=" + placeholders["<other life state>"] + ".";
+
+                // --- Location context (conditional) ---
+                // Only populated when the message requires CURRENT spatial state (see
+                // ChatHelper::needsCurrentLocationContext); otherwise left empty so the
+                // model receives no location data at all for this turn.
+                placeholders["<location context>"] = "";
+                if (ChatHelper::needsCurrentLocationContext(msg))
+                {
+                    placeholders["<location context>"] = "Current location: " + placeholders["<bot name>"] +
+                        " is in " + placeholders["<bot subzone>"] + ", " + placeholders["<bot zone>"] + "; " +
+                        placeholders["<other name>"] + " is in " + placeholders["<other subzone>"] + ", " +
+                        placeholders["<other zone>"] + ".";
+                }
+
+                placeholders["<chat addressing note>"] = "";
+                if (guid2)
+                {
+                    if (Player* addressed = sObjectAccessor.FindPlayer(ObjectGuid(HIGHGUID_PLAYER, guid2)))
+                    {
+                        std::string addressedName = addressed->GetName();
+                        placeholders["<chat addressing note>"] =
+                            "This message was addressed to " + addressedName + ", not to you. You are interjecting as a "
+                            "third party -- do not treat statements, questions, insults, praise, or descriptions about " +
+                            addressedName + " as if they were about you. Respond from the perspective of an outside "
+                            "participant in their conversation.";
+                    }
+                }
 
                 std::map<ChatChannelSource, std::string> sourceName;
                 sourceName[ChatChannelSource::SRC_GUILD] = "in guild chat";
@@ -565,6 +792,220 @@ void ChatReplyAction::ChatReplyDo(Player* bot, uint32 type, uint32 guid1, uint32
 
                 std::map<std::string, std::string> jsonFill;
                 jsonFill["<pre prompt>"] = sPlayerbotAIConfig.llmPrePrompt + " " + llmPromptCustom;
+
+                // Ronde 8b/10/11: per-turn current-speaker / language
+                // framing (unconditional part). Injected on EVERY
+                // real-player (or bot-to-bot) turn that reaches this branch.
+                // Ronde 11: the certainty/provenance rule that used to live
+                // here unconditionally ("Be certain only from ... No match
+                // ... means you don't know") is REMOVED from this
+                // unconditional block -- proven live to override a correct,
+                // already-injected persistent-memory fact (an English
+                // question with a matching memory still got "I don't know
+                // that for sure"). That rule now lives ONLY inside the
+                // memories-conditional branches below (see the
+                // GetActiveForSubject()/persistent-memory block just after
+                // this), so the model never reads an unconditional
+                // "say you don't know" instruction before it knows whether a
+                // matching fact exists. Current-speaker naming and the
+                // ronde-10 language rules are unaffected by this change.
+                // This is deliberately a "<pre prompt>" addition (read by
+                // the model BEFORE "<context>", per the
+                // "<pre prompt><context><prompt><post prompt>" template
+                // order) -- no DB/schema change, no extra LLM call, and
+                // never leaks back into llmContext since only "<prompt>" is
+                // folded back in.
+                jsonFill["<pre prompt>"] += " Current speaker: " + playerName +
+                    " (\"I\"/\"my\"/\"ik\"/\"mijn\" in their message below = " + playerName + "). "
+                    "Reply in the SAME language " + playerName + " just used in their message below -- Dutch message -> Dutch reply, English message -> English reply. "
+                    "Earlier context, your own earlier replies, and your character/personality text are NOT reasons to switch language -- only THIS message decides. "
+                    "Keep your personality and character exactly the same; only the language of your words follows " + playerName + "'s message.";
+
+                // Ticket 4a: chat itemlink grounding. Independent of the
+                // persistent-memory blocks below (Ticket 2/3a/3b1, which are
+                // untouched by this) -- an itemlink is grounded whenever the
+                // message contains one, not only when the message looks
+                // like a question. ChatHelper::BuildItemContextBlock() does
+                // all resolution/formatting itself; this call site only
+                // appends its result when non-empty, so SayAction.cpp does
+                // not contain any item-field-specific logic.
+                std::string itemContextBlock = ChatHelper::BuildItemContextBlock(msg);
+                if (!itemContextBlock.empty())
+                {
+                    jsonFill["<pre prompt>"] += " " + itemContextBlock +
+                        " itemdata is authoritative; verzin geen ingrediënten, lore, effecten of item-acties die niet in deze data/context staan.";
+                }
+
+                // Phase-1 persistent memory read-flow. Only for a genuine
+                // real-player conversation partner -- never for a bot-to-bot
+                // LLM reply, even on the rare path where
+                // AiPlayerbot.LLMBotToBotChatChance > 0 let one reach this
+                // branch above (player != bot && (IsRealPlayer(player) ||
+                // bot-to-bot roll)) -- matches the "wanneer een ECHTE speler
+                // een LLM-bot aanspreekt" scoping requirement exactly.
+                // sPlayerbotMemoryStore.GetActiveForSubject() is a cached,
+                // mutex-protected read (see PlayerbotMemoryStore.h); this
+                // call happens on the bot's own tick thread, same as
+                // everything else in ChatReplyDo().
+                // Appended directly here instead of via a literal
+                // "<persistent memory>" token in AiPlayerbot.LLMPrePrompt, so
+                // Phase 1 works without any config edit or reload. If a
+                // future config revision adds that token to LLMPrePrompt
+                // itself, remove this append first -- otherwise the block
+                // would be included twice.
+                // Ticket 2 (named-subject persistent memory, CONSERVATIEVE
+                // resolver): memorySubjectGuid/memorySubjectName default to
+                // the current speaker (unchanged Phase-1 behavior) and only
+                // switch on an explicit, unambiguous possessive match --
+                // see ResolveMemorySubject() above. playerName itself is
+                // left completely untouched: it still drives the separate
+                // "Current speaker: ..." language-framing text elsewhere in
+                // this function, which is about who is physically talking
+                // right now, not about whose memory this block is about.
+                bool skipMemoryBlock = false;
+                ObjectGuid memorySubjectGuid;
+                std::string memorySubjectName;
+                if (IsRealPlayer(player))
+                {
+                    memorySubjectGuid = player->GetObjectGuid();
+                    memorySubjectName = playerName;
+
+                    auto memorySubjectCandidates = BuildMemorySubjectCandidates(bot);
+                    ObjectGuid resolvedGuid;
+                    std::string resolvedName;
+                    switch (ResolveMemorySubject(msg, memorySubjectCandidates, resolvedGuid, resolvedName))
+                    {
+                    case MemorySubjectResolution::Resolved:
+                        memorySubjectGuid = resolvedGuid;
+                        memorySubjectName = resolvedName;
+                        break;
+                    case MemorySubjectResolution::Ambiguous:
+                        skipMemoryBlock = true;
+                        break;
+                    case MemorySubjectResolution::Default:
+                        break;
+                    }
+                }
+
+                // Ticket 3a: coarse, deterministic retrieval gate -- neither
+                // the fact-block nor the "no stored facts" branch below may
+                // run at all unless the message itself looks like SOME kind
+                // of information request (see ChatHelper::needsPersistentMemoryContext()
+                // and GetMemoryGatePhraseProfiles() in ChatHelper.cpp). This
+                // stops casual/status/progress chat ("ik heb nu 15 [Small
+                // Egg]") from spontaneously surfacing unrelated stored facts.
+                // Deliberately coarse -- not a personal-info classifier and
+                // not per-fact relevance/ranking; see Ticket 3b for that.
+                if (IsRealPlayer(player) && !skipMemoryBlock &&
+                    ChatHelper::needsPersistentMemoryContext(msg))
+                {
+                    // Ticket 3b1 (isolation pass): SayAction.cpp asks
+                    // ChatHelper exactly ONE generic question -- "which of
+                    // this subject's stored facts are relevant to this
+                    // message?" -- via FilterRelevantMemories(). It never
+                    // touches concept/topic-specific logic itself; that
+                    // stays entirely inside ChatHelper.cpp (see
+                    // ChatHelper::FilterRelevantMemories() and its
+                    // declaration in ChatHelper.h for what the three
+                    // possible results mean, why this boundary exists, and
+                    // where a future, more general relevance mechanism would
+                    // plug in later without this call site changing).
+                    auto allMemories = sPlayerbotMemoryStore.GetActiveForSubject(
+                        bot->GetObjectGuid().GetRawValue(), memorySubjectGuid.GetRawValue());
+
+                    std::vector<PlayerbotMemoryEntry> memories;
+                    ChatHelper::MemoryRelevanceResult relevance =
+                        ChatHelper::FilterRelevantMemories(msg, allMemories, memories);
+
+                    if (relevance == ChatHelper::MemoryRelevanceResult::FACTS_FOUND)
+                    {
+                        // Ronde 11: this intro sentence is now the ONLY place
+                        // the certainty/provenance rule for persistent memory
+                        // lives (moved out of the unconditional block above,
+                        // see the comment there) -- authoritative, must-use,
+                        // explicitly forbids "I don't know"/guessing when a
+                        // fact below already answers the question, and keeps
+                        // the existing warning that other speakers' facts and
+                        // the bot's own earlier replies are still unreliable.
+                        // fact_original itself is never rewritten, only
+                        // quoted verbatim in the loop below.
+                        std::string memoryBlock = "<persistent memory>\nAuthoritative known facts about " + memorySubjectName +
+                            " (not about anyone else, not about you). \"I\"/\"my\"/\"ik\"/\"mijn\" in these facts means " + memorySubjectName +
+                            ". If a fact below answers the current question, use it directly -- do not say you don't know and do not guess. "
+                            "Facts about a different person, and your own earlier replies, are still not reliable for " + memorySubjectName + ":\n";
+
+                        const size_t maxRows = 12; // keep the block small -- Phase 1 uses a simple bounded selection, not a full dump (see design doc section I). Applied AFTER Ticket 3b1's relevance filter (point 7).
+                        size_t rows = 0;
+                        for (auto const& mem : memories)
+                        {
+                            if (rows >= maxRows)
+                                break;
+                            memoryBlock += "- " + mem.factOriginal + "\n";
+                            ++rows;
+                        }
+                        memoryBlock += "</persistent memory>";
+
+                        jsonFill["<pre prompt>"] += " " + memoryBlock;
+                    }
+                    else if (relevance == ChatHelper::MemoryRelevanceResult::KNOWN_CONCEPT_NO_FACTS)
+                    {
+                        // Ticket 3b1: the message DID look on-topic to
+                        // ChatHelper, but no active fact for this subject
+                        // was judged relevant -- deliberately NOT the old
+                        // generic "You have no stored facts about X" text,
+                        // which would be misleading here (the subject may
+                        // well have OTHER, unrelated facts). Topic-specific
+                        // framing instead, same authoritative/no-guessing
+                        // intent as the branch above.
+                        jsonFill["<pre prompt>"] += " You have no stored fact relevant to this question about " + memorySubjectName + ". "
+                            "Do not infer or invent the answer from unrelated memories.";
+                    }
+                    // else: relevance == NO_KNOWN_CONCEPT -- the message did
+                    // not look on-topic to ChatHelper at all, so inject
+                    // nothing (neither a fact block nor any "no facts"
+                    // text). See ChatHelper::FilterRelevantMemories()'s
+                    // conservative-by-default design note.
+                }
+
+                // Phase-1 persistent memory RESPONSE flow: reuse THIS single
+                // LLM call to phrase a natural confirmation -- no second LLM
+                // call. HandleMemoryCommand() already performed the DB
+                // write/delete (or deliberate no-op) synchronously before
+                // ChatReplyDo() ever reached this branch, so `memoryResult`
+                // only carries an already-decided outcome for the LLM to
+                // phrase; the LLM cannot see or influence whether the DB
+                // operation itself succeeded. Appended to "<pre prompt>"
+                // only (never "<prompt>"), same reasoning as the
+                // <persistent memory> block just above: only "<prompt>" is
+                // folded back into llmContext further down (see
+                // `llmContext += " " + jsonFill["<prompt>"];`), so this
+                // ephemeral, single-turn directive never leaks into
+                // llmContext, Option-A context, or the ai_playerbot_memory
+                // table -- it exists for this one reply only.
+                if (memoryResult.handled)
+                {
+                    std::string memoryDirective = "[Internal note -- do not quote this verbatim, just acknowledge it briefly and naturally in your own character and in the same language the player just used: ";
+                    switch (memoryResult.outcome)
+                    {
+                    case MemoryCommandOutcome::REMEMBER_SUCCESS:
+                        memoryDirective += "you just permanently committed this fact to memory: \"" + memoryResult.factText + "\".]";
+                        break;
+                    case MemoryCommandOutcome::ALREADY_KNOWN:
+                        memoryDirective += "the player asked you to remember something you already had stored: \"" + memoryResult.factText + "\". Let them know you already knew this.]";
+                        break;
+                    case MemoryCommandOutcome::FORGET_SUCCESS:
+                        memoryDirective += "you just permanently removed this from memory: \"" + memoryResult.factText + "\".]";
+                        break;
+                    case MemoryCommandOutcome::FORGET_NOT_FOUND:
+                        memoryDirective += "the player asked you to forget something you did not have stored: \"" + memoryResult.factText + "\". Let them know there was nothing to forget.]";
+                        break;
+                    case MemoryCommandOutcome::FORGET_AMBIGUOUS:
+                        memoryDirective += "the player's forget request was not specific enough for you to safely identify a single memory to remove, so you left your memory unchanged: \"" + memoryResult.factText + "\". Let them know you are not sure exactly what to remove.]";
+                        break;
+                    }
+                    jsonFill["<pre prompt>"] += " " + memoryDirective;
+                }
+
                 jsonFill["<prompt>"] = sPlayerbotAIConfig.llmPrompt;
                 jsonFill["<post prompt>"] = sPlayerbotAIConfig.llmPostPrompt;
 
@@ -575,9 +1016,21 @@ void ChatReplyAction::ChatReplyDo(Player* bot, uint32 type, uint32 guid1, uint32
 
                 uint32 currentLength = jsonFill["<pre prompt>"].size() + jsonFill["<context>"].size() + jsonFill["<prompt>"].size() + llmContext.size();
                 PlayerbotLLMInterface::LimitContext(llmContext, currentLength);
-                jsonFill["<context>"] = llmContext;
 
-                llmContext += " " + jsonFill["<prompt>"];
+                if (useSubjectContext)
+                {
+                    uint32 subjectLength = jsonFill["<pre prompt>"].size() + jsonFill["<context>"].size() + jsonFill["<prompt>"].size() + subjectContext.size();
+                    PlayerbotLLMInterface::LimitContext(subjectContext, subjectLength);
+                    jsonFill["<context>"] = subjectContext;   // real, non-whisper player: only their own subject-context
+                }
+                else
+                {
+                    jsonFill["<context>"] = llmContext;       // unchanged behaviour: whisper, or no real player resolved
+                }
+
+                llmContext += " " + jsonFill["<prompt>"];         // UNCHANGED: shared bucket still records this line
+                if (useSubjectContext)
+                    subjectContext += " " + jsonFill["<prompt>"]; // NEW: same human line, subject-only bucket
 
                 for (auto& prompt : jsonFill)
                 {
@@ -650,7 +1103,19 @@ void ChatReplyAction::ChatReplyDo(Player* bot, uint32 type, uint32 guid1, uint32
                 WorldPacket emoteTemplate = (type == CHAT_MSG_SAY || type == CHAT_MSG_WHISPER) ? GetPacketTemplate(CMSG_MESSAGECHAT, CHAT_MSG_EMOTE, bot, player) : WorldPacket();
                 WorldPacket systemTemplate = GetPacketTemplate(CMSG_MESSAGECHAT, CHAT_MSG_WHISPER, bot, player);
 
-                futurePackets futPackets = std::async(std::launch::async, ChatReplyAction::GenerateResponsePackets, json, chatTemplate, emoteTemplate, systemTemplate, startPattern, endPattern, deletePattern, splitPattern, debug);
+                // If this turn is a handled Phase-1 memory command, precompute
+                // the same non-LLM fallback text BuildMemoryFallbackText()
+                // would produce (cheap -- one BOT_TEXT2 lookup, no I/O) and
+                // hand it to GenerateResponsePackets() so a runtime LLM
+                // failure (Ollama unreachable/timeout/HTTP error/empty
+                // response) still confirms the already-completed DB
+                // write/forget instead of silently dropping it. Computed
+                // here on the tick thread and passed by value into the
+                // async call below -- still exactly one Generate() call,
+                // no retry.
+                std::string memoryLlmFallbackText = memoryResult.handled ? BuildMemoryFallbackText(memoryResult) : std::string();
+
+                futurePackets futPackets = std::async(std::launch::async, ChatReplyAction::GenerateResponsePackets, json, chatTemplate, emoteTemplate, systemTemplate, startPattern, endPattern, deletePattern, splitPattern, debug, memoryLlmFallbackText);
 
                 ai->SendDelayedPacket(session, std::move(futPackets));
             }
@@ -659,16 +1124,263 @@ void ChatReplyAction::ChatReplyDo(Player* bot, uint32 type, uint32 guid1, uint32
                 if (msg.find("d:") != std::string::npos)
                     return;
 
-                llmContext = llmContext + " " + playerName + ":" + msg;
+                llmContext = llmContext + " " + playerName + ":" + msg;   // UNCHANGED
                 PlayerbotLLMInterface::LimitContext(llmContext, llmContext.size());
+
+                if (useSubjectContext)   // false for bot-authored senders -- IsRealPlayer already in the gate above
+                {
+                    subjectContext = subjectContext + " " + playerName + ":" + msg;
+                    PlayerbotLLMInterface::LimitContext(subjectContext, subjectContext.size());
+                }
             }
-            SET_AI_VALUE(std::string, "manual string::llmcontext" + llmChannel, llmContext);
+            SET_AI_VALUE(std::string, "manual string::llmcontext" + llmChannel, llmContext);   // UNCHANGED
+            if (useSubjectContext)
+                SET_AI_VALUE2(std::string, "manual string::llmcontext_subject", subjectKey, subjectContext);   // NEW
 
             return;
         }
     }
 
+    // Phase-1 persistent memory fallback: reached only when a memory command
+    // WAS handled (DB write/delete already done) but the LLM-reply branch
+    // above was not eligible for this message (LLM chat disabled/blocked for
+    // this bot/channel, or the conversation partner could not be resolved)
+    // and therefore never phrased a confirmation. Uses a non-LLM,
+    // BOT_TEXT2-backed text (see BuildMemoryFallbackText()) instead of
+    // GenerateReplyMessage()'s generic "did not understand" reply, so the
+    // player still gets an accurate confirmation even when the LLM path is
+    // unavailable -- still no hardcoded Dutch/English sentence literals in
+    // this file, only symbolic BOT_TEXT2 keys.
+    if (memoryResult.handled)
+    {
+        SendGeneralResponse(bot, chatChannelSource, BuildMemoryFallbackText(memoryResult), name);
+        return;
+    }
+
     SendGeneralResponse(bot, chatChannelSource, GenerateReplyMessage(bot, msg, guid1, name), name);
+}
+
+// Option-A party-context patch (2026-09-06): records a party message into
+// `bot`'s own "manual string::llmcontext<channel>" bucket without ever
+// generating a reply -- used for messages PlayerbotAI::HandleBotOutgoingPacket()
+// decided `bot` may not answer (addressed to a different party member and no
+// won interjection; or sent by another free/random bot), but that `bot`
+// should still silently hear/remember. Deliberately a narrow subset of
+// ChatReplyDo() above: same channel gate, same llmChannel key formula, same
+// PlayerbotLLMInterface::LimitContext() budget accounting as the existing
+// context-only branch there -- so a line recorded here looks exactly like one
+// recorded through the normal reply path, and the two can never both fire for
+// the same message (see PlayerbotAI::UpdateAIInternal(), which calls exactly
+// one of ChatReplyDo()/AppendPartyContextOnly() per queued entry).
+// Scope: party chat only (SRC_PARTY), enforced here again defensively even
+// though today's only two call sites in PlayerbotAI.cpp already guarantee it.
+// Only ever called from PlayerbotAI::UpdateAIInternal()'s chatReplies dequeue
+// loop (the bot's own tick thread) -- never call this, or touch
+// AiObjectContext/AI_VALUE/SET_AI_VALUE in any other new code, from
+// PlayerbotAI::HandleBotOutgoingPacket() directly.
+void ChatReplyAction::AppendPartyContextOnly(Player* bot, uint32 type, uint32 guid1, std::string msg, std::string chanName, std::string name)
+{
+    if (!GetBotAI(bot))
+        return;
+
+    ChatChannelSource chatChannelSource = GetBotAI(bot)->GetChatChannelSource(bot, type, chanName);
+
+    if (sPlayerbotAIConfig.llmEnabled <= 0
+        || !(GetBotAI(bot)->HasStrategy("ai chat", BotState::BOT_STATE_NON_COMBAT) || sPlayerbotAIConfig.llmEnabled == 3)
+        || chatChannelSource != ChatChannelSource::SRC_PARTY
+        || sPlayerbotAIConfig.llmBlockedReplyChannels.find(chatChannelSource) != sPlayerbotAIConfig.llmBlockedReplyChannels.end())
+        return;
+
+    Player* player = sObjectAccessor.FindPlayer(ObjectGuid(HIGHGUID_PLAYER, guid1));
+
+    PlayerbotAI* ai = GetBotAI(bot);
+    AiObjectContext* context = ai->GetAiObjectContext();
+
+    if (!chanName.empty() && !ai->ChannelHasRealPlayer(chanName))
+        player = nullptr;
+
+    if (!player || player == bot)
+        return;
+
+    if (msg.find("d:") != std::string::npos)
+        return;
+
+    std::string playerName = player->GetName();
+
+    std::string llmChannel;
+    if (!sPlayerbotAIConfig.llmGlobalContext)
+        llmChannel = ((chatChannelSource == ChatChannelSource::SRC_WHISPER) ? name : std::to_string(chatChannelSource));
+
+    std::string llmContext = AI_VALUE(std::string, "manual string::llmcontext" + llmChannel);
+    llmContext = llmContext + " " + playerName + ":" + msg;                              // UNCHANGED
+    PlayerbotLLMInterface::LimitContext(llmContext, llmContext.size());
+    SET_AI_VALUE(std::string, "manual string::llmcontext" + llmChannel, llmContext);      // UNCHANGED
+
+    // Structural subject-context fix -- same gate/key formula as ChatReplyDo()
+    // above. IsRealPlayer() excludes bot-authored senders (free/random bots
+    // named by another party member never reach a player-subject bucket).
+    // The SRC_PARTY-only guard at the top of this function already excludes
+    // whisper today; the explicit check here is defensive against that guard
+    // ever being loosened later. type == CHAT_MSG_PARTY here, so
+    // BuildSubjectKey() always takes its non-channel branch -- no chanName
+    // logic needed, matching this function's PARTY-only scope.
+    if (IsRealPlayer(player) && chatChannelSource != ChatChannelSource::SRC_WHISPER)
+    {
+        std::string subjectKey = BuildSubjectKey(type, chatChannelSource, chanName, guid1);
+        std::string subjectContext = AI_VALUE2(std::string, "manual string::llmcontext_subject", subjectKey);
+        subjectContext = subjectContext + " " + playerName + ":" + msg;
+        PlayerbotLLMInterface::LimitContext(subjectContext, subjectContext.size());
+        SET_AI_VALUE2(std::string, "manual string::llmcontext_subject", subjectKey, subjectContext);
+    }
+}
+
+// Phase-1 persistent LLM memory ("<bot>, remember/onthoud that ..." /
+// "<bot>, forget/vergeet that ..."). See PlayerbotMemoryStore.h for the full
+// design rationale and the thread-safety guarantee this relies on: this
+// function -- like every other Handle*Reply helper in this file -- is only
+// ever called from ChatReplyDo(), which is only ever called from
+// PlayerbotAI::UpdateAIInternal()'s chatReplies queue-drain loop, i.e.
+// always on the bot's own tick thread. The write/delete itself
+// (PlayerbotMemoryStore::Remember()/Forget()) therefore also always runs on
+// that same tick thread -- never from PlayerbotAI::HandleBotOutgoingPacket()
+// or any other possibly-async packet-handler path. This function performs
+// the write/delete itself and returns the authoritative result; it never
+// sends a chat response -- see ChatReplyDo() for how the confirmation gets
+// phrased (existing LLM call when eligible, BuildMemoryFallbackText()
+// otherwise).
+//
+// ABSOLUTE GUARD 1 (who): bot-authored chat can never reach
+// Remember()/Forget() through this function, enforced here in code, not by
+// prompt wording -- IsRealPlayer(sender) is re-checked from guid1
+// independently of whatever gauntlet already let this message reach
+// ChatReplyDo(), and any failure to resolve a real player leaves
+// `result.handled == false` (falls through to ordinary handling) before
+// either store method is ever called.
+//
+// ABSOLUTE GUARD 2 (which bot): a broadcast-channel message (party/guild/
+// raid/say/yell) can independently reach every bot's own ChatReplyDo() call
+// for the exact same text -- each bot decides for itself whether to reply.
+// Without an addressing check, EVERY such bot would treat "Ravanne, onthoud
+// dat ..." as addressed to itself (confirmed live: both Ravanne and Malurith
+// wrote the same memory from one guild message). So for every channel
+// except whisper (already bot-specific by construction -- only the
+// addressed bot's client, and therefore only that bot's ChatReplyDo(), ever
+// sees a given whisper), this bot's own name must exactly match the
+// message's LEADING VOCATIVE as already parsed by
+// ChatHelper::detectMemoryTrigger() (trigger.addressedName) -- never a scan
+// for the bot's name anywhere in the message, which would also match a bot
+// name mentioned mid-sentence ("Ravanne, onthoud dat Malurith mijn beste
+// vriend is." must resolve to Ravanne only, never Malurith). A broadcast
+// message with no leading vocative at all (addressedName empty) is left
+// unhandled for every bot -- conservative by design, never guessed.
+MemoryCommandResult ChatReplyAction::HandleMemoryCommand(Player* bot, ChatChannelSource chatChannelSource, std::string msg, uint32 guid1, std::string name)
+{
+    MemoryCommandResult result;
+
+    ChatHelper::MemoryTriggerResult trigger = ChatHelper::detectMemoryTrigger(msg);
+    if (trigger.action == ChatHelper::MemoryTriggerAction::NONE)
+        return result; // Not a memory command -- result.handled stays false.
+
+    Player* sender = sObjectAccessor.FindPlayer(ObjectGuid(HIGHGUID_PLAYER, guid1));
+    if (!sender || !IsRealPlayer(sender))
+        return result; // Hard guard 1 -- see the function comment above.
+
+    if (chatChannelSource != ChatChannelSource::SRC_WHISPER
+        && (trigger.addressedName.empty() || !boost::iequals(trigger.addressedName, bot->GetName())))
+        return result; // Hard guard 2 -- see the function comment above.
+
+    if (trigger.factText.empty())
+        return result; // e.g. "Ravanne, onthoud" with nothing after it -- nothing explicit to store, treat as an ordinary message rather than guessing.
+
+    result.factText = trigger.factText;
+    result.language = trigger.language;
+
+    uint64 botGuid = bot->GetObjectGuid().GetRawValue();
+    uint64 subjectGuid = sender->GetObjectGuid().GetRawValue();
+
+    if (trigger.action == ChatHelper::MemoryTriggerAction::REMEMBER)
+    {
+        bool wasNew = false;
+        sPlayerbotMemoryStore.Remember(botGuid, subjectGuid, subjectGuid, trigger.factText, &wasNew);
+
+        result.handled = true;
+        result.outcome = wasNew ? MemoryCommandOutcome::REMEMBER_SUCCESS : MemoryCommandOutcome::ALREADY_KNOWN;
+        return result;
+    }
+
+    // FORGET
+    PlayerbotMemoryForgetResult forgetResult = sPlayerbotMemoryStore.Forget(botGuid, subjectGuid, trigger.factText);
+
+    result.handled = true;
+    switch (forgetResult)
+    {
+        case PlayerbotMemoryForgetResult::Forgotten:
+            result.outcome = MemoryCommandOutcome::FORGET_SUCCESS;
+            break;
+        case PlayerbotMemoryForgetResult::NotFound:
+            result.outcome = MemoryCommandOutcome::FORGET_NOT_FOUND;
+            break;
+        case PlayerbotMemoryForgetResult::Ambiguous:
+            result.outcome = MemoryCommandOutcome::FORGET_AMBIGUOUS;
+            break;
+    }
+    return result;
+}
+
+// Non-LLM fallback confirmation text, used both when HandleMemoryCommand()
+// handled a memory command but ChatReplyDo()'s ordinary LLM-reply branch was
+// not eligible for this message, and when that branch WAS eligible but the
+// runtime Generate() call itself failed (see the fallbackText plumbing into
+// GenerateResponsePackets() below). Deliberately contains no hardcoded
+// Dutch/English sentence literals -- only symbolic BOT_TEXT2 keys.
+//
+// Language selection: PlayerbotTextMgr's text/text_loc1..8 + GetLocalePriority()
+// mechanism (used by every other BOT_TEXT/BOT_TEXT2 call in this file,
+// e.g. "thunderfury_spam") cannot be used here -- text_loc1..8 are indexed by
+// WorldSession's LocaleConstant, i.e. real WoW client locales the game
+// client itself negotiates at login (confirmed: LOCALE_enUS/LOCALE_zhCN
+// exist, PlayerbotTextMgr loops 8 slots via MAX_LOCALE). Dutch/nlNL has
+// never been a WoW client locale, so no text_locN slot for it can ever
+// exist or be selected -- GetLocalePriority() has structurally no way to
+// pick "Dutch". This function therefore selects between two keys per
+// outcome (5 outcomes x 2 languages = 10 keys total) using result.language
+// ("nl"/"en", set by ChatHelper::detectMemoryTrigger() from which trigger
+// phrase matched the player's own message) directly, instead. Still no
+// PlayerbotTextMgr change and no hardcoded reply text in this file -- only
+// the symbolic key name differs per language; the actual Dutch/English
+// sentences live in ai_playerbot_texts.
+// If a key has no row yet in ai_playerbot_texts, BOT_TEXT2 falls back to
+// showing the key text itself (PlayerbotTextMgr::GetBotText's documented
+// behaviour) -- a visible but harmless degraded state, never a hardcoded
+// sentence added here to paper over it.
+std::string ChatReplyAction::BuildMemoryFallbackText(const MemoryCommandResult& result)
+{
+    bool dutch = (result.language == "nl");
+
+    std::string key;
+    switch (result.outcome)
+    {
+        case MemoryCommandOutcome::REMEMBER_SUCCESS:
+            key = dutch ? "memory_remember_success_nl" : "memory_remember_success_en";
+            break;
+        case MemoryCommandOutcome::ALREADY_KNOWN:
+            key = dutch ? "memory_already_known_nl" : "memory_already_known_en";
+            break;
+        case MemoryCommandOutcome::FORGET_SUCCESS:
+            key = dutch ? "memory_forget_success_nl" : "memory_forget_success_en";
+            break;
+        case MemoryCommandOutcome::FORGET_NOT_FOUND:
+            key = dutch ? "memory_forget_not_found_nl" : "memory_forget_not_found_en";
+            break;
+        case MemoryCommandOutcome::FORGET_AMBIGUOUS:
+            key = dutch ? "memory_forget_ambiguous_nl" : "memory_forget_ambiguous_en";
+            break;
+    }
+
+    std::map<std::string, std::string> placeholders;
+    placeholders["%fact%"] = result.factText;
+
+    return BOT_TEXT2(key, placeholders);
 }
 
 bool ChatReplyAction::HandleThunderfuryReply(Player* bot, ChatChannelSource chatChannelSource, std::string msg, std::string name)
@@ -1039,6 +1751,16 @@ bool ChatReplyAction::SendGeneralResponse(Player* bot, ChatChannelSource chatCha
     case ChatChannelSource::SRC_GUILD:
     {
         GetBotAI(bot)->SayToGuild(responseMessage);
+        break;
+    }
+    case ChatChannelSource::SRC_PARTY:
+    {
+        GetBotAI(bot)->SayToParty(responseMessage);
+        break;
+    }
+    case ChatChannelSource::SRC_RAID:
+    {
+        GetBotAI(bot)->SayToRaid(responseMessage);
         break;
     }
     default:

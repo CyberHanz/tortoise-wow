@@ -342,22 +342,18 @@ struct spell_druid_healing_touch : public SpellScript
             return;
 
         int32 refundPct = 0;
-        // ownerAura is a raw pointer captured when the modifier was applied.
-        // If the aura expires while the spell is still in flight it points at
-        // freed memory - on 2026-08-06 it held a string from the playerbot
-        // module. spellId carries the same id and is set from that very aura
-        // in the constructor, so the field is enough and the pointer stays
-        // untouched.
-        for (SpellModifier const* mod : spell->m_appliedMods)
+        // Read the spellIds captured by value in Player::DropModCharge rather
+        // than dereferencing SpellModifier pointers from m_appliedMods: a
+        // modifier can be freed (e.g. its owning aura removed via a
+        // stack-replacement) before this cast reaches OnFinish, which made
+        // reading mod->spellId here a use-after-free.
+        for (uint32 consumedSpellId : spell->m_consumedModSpellIds)
         {
-            if (!mod)
-                continue;
-
-            switch (mod->spellId)
+            switch (consumedSpellId)
             {
                 case SPELL_DRUID_AESSINAS_BLOOM_BUFF_RANK_1:
                 case SPELL_DRUID_AESSINAS_BLOOM_BUFF_RANK_2:
-                    if (SpellEntry const* bloomInfo = sSpellMgr.GetSpellEntry(mod->spellId))
+                    if (SpellEntry const* bloomInfo = sSpellMgr.GetSpellEntry(consumedSpellId))
                         refundPct = std::max(refundPct, bloomInfo->CalculateSimpleValue(EFFECT_INDEX_0));
                     break;
                 default:
