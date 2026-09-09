@@ -660,6 +660,16 @@ public:
         std::string const& addr = ((Player*)unit)->GetSession()->GetRemoteAddress();
         return addr != "disconnected/bot" && addr != "<BOT>";
     }
+    // Canned-greeting gate (2026-09-08 grounding follow-up): true when this
+    // bot's chat actually goes through the LLM branch of
+    // ChatReplyAction::ChatReplyDo() (SayAction.cpp) -- mirrors that
+    // branch's own eligibility check (llmEnabled>0 && ("ai chat" strategy
+    // or llmEnabled==3)) verbatim, minus the per-message channel/source
+    // checks that don't apply to a proactive master-assignment event. Used
+    // to skip the static BOT_TEXT("hello") canned text on LLM-capable bots
+    // so it doesn't precede/compete with their own generated greeting;
+    // non-LLM bots keep the existing canned greeting unchanged.
+    bool IsLlmChatCapable() { return sPlayerbotAIConfig.llmEnabled > 0 && (HasStrategy("ai chat", BotState::BOT_STATE_NON_COMBAT) || sPlayerbotAIConfig.llmEnabled == 3); }
     bool IsSelfMaster() { return master ? (master == bot) : false; }
     //Bot has a master that is a player.
     bool HasRealPlayerMaster() { return master && (!GetBotAI(master) || GetBotAI(master)->IsRealPlayer()); } 

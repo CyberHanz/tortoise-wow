@@ -226,6 +226,21 @@ namespace ai
         // incoming message).
         static std::string BuildItemContextBlock(const std::string& message);
 
+        // Ticket 4a debug fix: deterministic clickable-itemlink post-
+        // processing. Scans one already-generated bot reply `line` for a
+        // plain-text mention of any item resolved from `qualifierStrings`
+        // (the same qualifier set BuildItemContextBlock() resolves for the
+        // incoming message) and replaces it with a real, clickable
+        // |Hitem:...|h[name]|h|r link via formatItem() -- so the LLM is
+        // never asked to produce link control codes itself, and the
+        // enchant/gem/random-property qualifier of the ORIGINAL link the
+        // player sent is preserved exactly (same qualifier string in,
+        // formatItem() reproduces it in the link out). A line that already
+        // contains a raw item link is returned unchanged (nothing to do,
+        // and never double-wrap). No DB query, no extra LLM call -- same
+        // in-memory item cache lookups as BuildItemContextBlock() above.
+        static std::string LinkifyItemMentions(const std::string& line, const std::set<std::string>& qualifierStrings);
+
         // Phase-1 persistent-memory trigger action, returned by
         // detectMemoryTrigger() below. NONE means "not a memory command at
         // all" -- the message is left completely untouched and falls through

@@ -350,7 +350,11 @@ bool SpiritHealerAction::Execute(Event& event)
         // bot is alive and earning again.
         context->GetValue<Unit*>("current target")->Set(nullptr);
         bot->SetSelectionGuid(ObjectGuid());
-        ai->TellPlayer(requester, BOT_TEXT("hello"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        // Grounding follow-up (2026-09-08): LLM-capable bots skip the
+        // canned greeting here so it doesn't precede their own generated
+        // one.
+        if (!ai->IsLlmChatCapable())
+            ai->TellPlayer(requester, BOT_TEXT("hello"), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         sPlayerbotAIConfig.logEvent(ai, "ReviveFromSpiritHealerAction");
 
         return true;

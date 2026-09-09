@@ -1267,6 +1267,16 @@ bool MovementAction::MoveTo2(const WorldPosition& endPos, bool idle, bool react,
 #endif
 
 
+    // Cleanup pass (2026-09-08): isAbnormalClimb is now declared out here
+    // (was local to the "if" block below) so the reject-gate right before
+    // DispatchMovement(), further down, can see it. The detection logic
+    // itself -- the whole IF-AH-specific block below -- is UNCHANGED; this
+    // used to only sLog.outError() the bug and then dispatch the bad path
+    // anyway, causing the ~60m roof-climb jump. Deliberately not touched:
+    // the actual node/route selection in TravelNode.cpp -- this stays a
+    // local reject, not a pathfinder change.
+    bool isAbnormalClimb = false;
+
     // DEBUG: Check for Ironforge AH roof climbing bug
     // IF Auction House is at approx -4900, -950, 500 (Military Ward)
     const float IF_AH_X = -4900.0f;
@@ -1274,8 +1284,8 @@ bool MovementAction::MoveTo2(const WorldPosition& endPos, bool idle, bool react,
     const float IF_AH_Z = 500.0f;
     const float IF_AH_MAP = 0.0f;  // Eastern Kingdoms
     const float CHECK_RADIUS = 150.0f;
-    
-    if (bot->GetMapId() == (uint32)IF_AH_MAP && 
+
+    if (bot->GetMapId() == (uint32)IF_AH_MAP &&
         startPos.sqDistance2d(WorldPosition(0, IF_AH_X, IF_AH_Y, 0)) < CHECK_RADIUS * CHECK_RADIUS && 
         !movePath.empty())
     {
@@ -1297,7 +1307,7 @@ bool MovementAction::MoveTo2(const WorldPosition& endPos, bool idle, bool react,
         
         // Check if Z change is abnormally large compared to XY (climbing through roof)
         // Normal walking should have Z/X ratio < 0.5, roof climbing can be > 2.0
-        bool isAbnormalClimb = (totalZ > 5.0f && totalXY > 0.1f && totalZ / totalXY > 1.5f) || maxZDelta > 50.0f;
+        isAbnormalClimb = (totalZ > 5.0f && totalXY > 0.1f && totalZ / totalXY > 1.5f) || maxZDelta > 50.0f;
         
         if (isAbnormalClimb)
         {
@@ -1340,6 +1350,19 @@ bool MovementAction::MoveTo2(const WorldPosition& endPos, bool idle, bool react,
         }
     }
     // END DEBUG
+
+    // Cleanup pass (2026-09-08): actually reject the path instead of only
+    // logging it -- the block above already detected and logged this exact
+    // situation, it just never stopped the bad path from being dispatched.
+    // Scope stays as narrow as the detection above (Eastern Kingdoms map,
+    // within CHECK_RADIUS of the Ironforge AH): every move outside that
+    // gate is completely unaffected. Not a pathfinder fix -- the bad
+    // route/node choice itself is untouched; this only refuses to walk it.
+    if (isAbnormalClimb)
+    {
+        sLog.outError("[BOT PATH BUG] %s: rejecting abnormal-climb path near IF AH, not dispatching this move.", bot->GetName());
+        return false;
+    }
 
     DispatchMovement(movePath, generatePath, masterWalking);
 

@@ -6,6 +6,7 @@
 #include "UseItemAction.h"
 #include "playerbot/strategy/values/LastMovementValue.h"
 #include "SayAction.h"
+#include "PlayerbotChatAI.h"
 
 namespace ai
 {

@@ -86,7 +86,11 @@ bool SummonAction::Execute(Event& event)
         if (!Teleport(requester, requester, bot))
             return false;
 
-        ai->TellPlayerNoFacing(requester, BOT_TEXT("hello"));
+        // Grounding follow-up (2026-09-08): LLM-capable bots skip the
+        // canned greeting here so it doesn't precede their own generated
+        // one.
+        if (!ai->IsLlmChatCapable())
+            ai->TellPlayerNoFacing(requester, BOT_TEXT("hello"));
         return true;
     }
 
@@ -98,7 +102,11 @@ bool SummonAction::Execute(Event& event)
 
     if (SummonUsingGos(requester, requester, bot) || SummonUsingNpcs(requester, requester, bot))
     {
-        ai->TellPlayerNoFacing(requester, BOT_TEXT("hello"));
+        // Grounding follow-up (2026-09-08): LLM-capable bots skip the
+        // canned greeting here so it doesn't precede their own generated
+        // one.
+        if (!ai->IsLlmChatCapable())
+            ai->TellPlayerNoFacing(requester, BOT_TEXT("hello"));
         return true;
     }
 

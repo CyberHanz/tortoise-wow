@@ -690,6 +690,21 @@ bool RefreshTravelTargetAction::isUseful()
     if (!WorldPosition(bot).isOverworld())
         return false;
 
+    // Cleanup pass (2026-09-08): oscillation fix. This action nudges the
+    // travel target to a new nearby point on ~90% of ticks (the urand()
+    // roll just below), independent of whether the bot is already
+    // essentially at its current destination -- combined with MoveTo2's
+    // "close enough, stop re-issuing moves" tolerance
+    // (AiPlayerbot.TargetPosRecalcDistance, PlayerbotAIConfig.cpp) being
+    // reachable but this action still moving the goalpost anyway, bots were
+    // observed running back and forth between two close points. If the bot
+    // is already within that same tolerance of its current travel-target
+    // position, there is nothing to refresh yet -- skip unconditionally
+    // rather than rolling.
+    TravelTarget* currentRefreshTarget = AI_VALUE(TravelTarget*, "travel target");
+    if (currentRefreshTarget->GetPosition() && currentRefreshTarget->GetPosition()->distance(bot) < sPlayerbotAIConfig.targetPosRecalcDistance)
+        return false;
+
     if (urand(1, 100) <= 10)
         return false;
 

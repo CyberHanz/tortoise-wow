@@ -26,7 +26,7 @@
 // The underlying CharacterDatabase PQuery/PExecute calls are already used
 // concurrently elsewhere in this codebase without extra locking.
 //
-// Call-site guarantee (enforced in strategy/actions/SayAction.cpp, NOT here):
+// Call-site guarantee (enforced in strategy/actions/PlayerbotChatAI.cpp, NOT here):
 // Remember()/Forget() are only ever invoked from
 // ChatReplyAction::HandleMemoryCommand(), which is only ever invoked from
 // ChatReplyAction::ChatReplyDo(), which is only ever invoked from

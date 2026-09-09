@@ -14,7 +14,7 @@
 #include "Maps/CellImpl.h"
 #include "strategy/values/LastMovementValue.h"
 #include "strategy/actions/LogLevelAction.h"
-#include "strategy/actions/SayAction.h"
+#include "strategy/actions/PlayerbotChatAI.h"
 #include "strategy/actions/EmoteAction.h"
 #include "strategy/values/LastSpellCastValue.h"
 #include "LootObjectStack.h"
@@ -2678,7 +2678,10 @@ void PlayerbotAI::DoNextAction(bool min)
             {
                 TellPlayer(master, BOT_TEXT("hello_follow"));
             }
-            else
+            // Grounding follow-up (2026-09-08): LLM-capable bots skip the
+            // canned greeting here so it doesn't precede their own
+            // generated one.
+            else if (!IsLlmChatCapable())
             {
                 TellPlayer(master, BOT_TEXT("hello"));
             }
@@ -6468,8 +6471,18 @@ bool PlayerbotAI::ChannelHasRealPlayer(std::string channelName)
         {
             ChannelAcces* chna = reinterpret_cast<ChannelAcces*>(chn);
 
+            // Cleanup pass (2026-09-08): sRandomPlayerbotMgr.GetPlayers() is a
+            // mixed map -- it holds bots (RandomPlayerbotMgr::MovePlayerBot())
+            // as well as real players (RandomPlayerbotMgr::OnPlayerLogin()) --
+            // so without the IsRealPlayer() check below this function returned
+            // true for a channel full of bots too, defeating its own name and
+            // its only caller's purpose (SayAction.cpp forces the LLM chat
+            // partner to nullptr, silently falling back to the legacy
+            // ELIZA-style GenerateReplyMessage() canned replies, whenever this
+            // returned false for a channel that in fact had a real player on
+            // it).
             for (auto& player : sRandomPlayerbotMgr.GetPlayers())
-                if (chna->IsOn(player.second->GetObjectGuid()))
+                if (player.second && IsRealPlayer(player.second) && chna->IsOn(player.second->GetObjectGuid()))
                     return true;
         }
     }

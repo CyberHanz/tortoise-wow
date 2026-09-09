@@ -507,6 +507,20 @@ bool StoreLootAction::IsLootAllowed(ItemQualifier& itemQualifier, PlayerbotAI *a
     if (!proto)
         return false;
 
+    // Cleanup pass (2026-09-08): loot everything when not grouped with a
+    // real player, so the corpse's own loot list empties out and the engine
+    // flips UNIT_FLAG_SKINNABLE (only set once Loot::IsLootedForAll() is
+    // true -- see OpenLootAction::DoLoot() / LootObject::Refresh(), both in
+    // this file / LootObjectStack.cpp). Everything below this point (always/
+    // skip loot lists, the MaxCount cap, quest-autocomplete logic, and
+    // LootStrategyValue::CanLoot()'s equip/vendor/quest/skill/use
+    // preferences) is SELECTIVE-looting behaviour, not a correctness guard,
+    // so it's the right thing to bypass here. With a real player in the
+    // group/raid, none of that changes -- the existing selective logic
+    // below still runs exactly as before.
+    if (ai->GetRealPlayersInGroup().empty())
+        return true;
+
     std::set<uint32>& lootItems = AI_VALUE(std::set<uint32>&, "always loot list");
     if (lootItems.find(itemQualifier.GetId()) != lootItems.end())
         return true;

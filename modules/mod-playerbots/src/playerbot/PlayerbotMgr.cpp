@@ -866,7 +866,10 @@ void PlayerbotHolder::OnBotLogin(Player * const bot)
     // set delay on login
     ai->SetActionDuration(urand(2000, 4000));
 
-    ai->TellPlayer(ai->GetMaster(), BOT_TEXT("hello"));
+    // Grounding follow-up (2026-09-08): LLM-capable bots skip the canned
+    // greeting here so it doesn't precede their own generated one.
+    if (!ai->IsLlmChatCapable())
+        ai->TellPlayer(ai->GetMaster(), BOT_TEXT("hello"));
 
     JoinChatChannels(bot);
 

@@ -561,6 +561,91 @@ std::string ChatHelper::BuildItemContextBlock(const std::string& message)
     return out.str();
 }
 
+// Ticket 4a debug fix -- see the declaration in ChatHelper.h for the full
+// contract. Resolves each qualifier the exact same way BuildItemContextBlock()
+// does above (locale name override, then random-property suffix), then does
+// a case-insensitive, alphanumeric-boundary-aware scan for that name in
+// `line` (same boundary rule as isNameMentioned() above, kept local here
+// since this one also needs the match position to replace, not just detect
+// it) and swaps every plain-text occurrence for formatItem()'s real link.
+// count=1/total=0 in the formatItem() call below reproduces exactly
+// "|c<color>|Hitem:<qualifier>|h[<name>]|h|r" with no "xN"/"(N)" suffix.
+std::string ChatHelper::LinkifyItemMentions(const std::string& line, const std::set<std::string>& qualifierStrings)
+{
+    if (qualifierStrings.empty() || line.find("|Hitem:") != std::string::npos)
+        return line; // nothing to link, or the reply already contains a real item link -- never double-wrap.
+
+    auto isBoundaryChar = [](unsigned char c) { return std::isalnum(c) == 0; };
+
+    std::string result = line;
+    int loc_idx = sPlayerbotTextMgr.GetLocalePriority();
+
+    for (const std::string& qualifierString : qualifierStrings)
+    {
+        ItemQualifier qualifier(qualifierString);
+        ItemPrototype const* proto = qualifier.GetProto();
+        if (!proto)
+            continue; // unknown/removed item -- nothing to link.
+
+        std::string name = proto->Name1;
+        if (loc_idx >= 0)
+        {
+            std::string tname;
+            sObjectMgr.GetItemLocaleStrings(qualifier.GetId(), loc_idx, &tname);
+            if (!tname.empty())
+                name = tname;
+        }
+        if (qualifier.GetRandomPropertyId())
+        {
+            ItemRandomPropertiesEntry const* item_rand = sItemRandomPropertiesStore.LookupEntry(abs(qualifier.GetRandomPropertyId()));
+            if (item_rand)
+            {
+                int suffixLocIdx = loc_idx >= 0 ? loc_idx : 0;
+                std::string suffix = item_rand->nameSuffix[suffixLocIdx];
+                if (!suffix.empty())
+                    name += " " + suffix;
+            }
+        }
+
+        if (name.empty() || result.size() < name.size())
+            continue;
+
+        std::string link = formatItem(qualifier, 1, 0);
+
+        size_t pos = 0;
+        while (pos + name.size() <= result.size())
+        {
+            bool match = true;
+            for (size_t i = 0; i < name.size(); ++i)
+            {
+                if (std::tolower(static_cast<unsigned char>(result[pos + i])) != std::tolower(static_cast<unsigned char>(name[i])))
+                {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match)
+            {
+                bool leftOk = (pos == 0) || isBoundaryChar(result[pos - 1]);
+                size_t afterPos = pos + name.size();
+                bool rightOk = (afterPos == result.size()) || isBoundaryChar(result[afterPos]);
+
+                if (leftOk && rightOk)
+                {
+                    result.replace(pos, name.size(), link);
+                    pos += link.size(); // skip past the inserted link -- its own "[name]" text must not be re-matched.
+                    continue;
+                }
+            }
+
+            ++pos;
+        }
+    }
+
+    return result;
+}
+
 std::string ChatHelper::formatQuest(Quest const* quest)
 {
     std::ostringstream out;

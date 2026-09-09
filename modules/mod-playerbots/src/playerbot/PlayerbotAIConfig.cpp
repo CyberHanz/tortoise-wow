@@ -844,7 +844,14 @@ bool PlayerbotAIConfig::Initialize()
 
     loadFreeAltBotAccounts();
 
-    targetPosRecalcDistance = config.GetFloatDefault("AiPlayerbot.TargetPosRecalcDistance", 0.1f),
+    // Cleanup pass (2026-09-08): 0.1yd was so tight that ordinary movement-
+    // generator overshoot/settle noise almost never satisfied MoveTo2's
+    // "close enough, stop re-issuing moves" check (MovementActions.cpp),
+    // so a bot kept recomputing/redispatching movement long after it was
+    // effectively at its destination -- part of the reported back-and-forth
+    // oscillation. 1.5yd is still tight enough that a bot won't visibly
+    // stop short of its actual target.
+    targetPosRecalcDistance = config.GetFloatDefault("AiPlayerbot.TargetPosRecalcDistance", 1.5f),
 
     sLog.outString("Loading area levels.");
     sTravelMgr.LoadAreaLevels();
