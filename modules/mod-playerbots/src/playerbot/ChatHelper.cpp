@@ -459,7 +459,216 @@ namespace
 // a chat-link, since this goes into the LLM prompt, not to chat. An item id
 // that no longer resolves (removed/unknown) is skipped rather than
 // reported with guessed data.
-std::string ChatHelper::BuildItemContextBlock(const std::string& message)
+namespace
+{
+    // Human-readable WoW names for the chat-context item block
+    // (BuildItemContextBlock() below). Deliberately local to this file and
+    // scoped only to what that block needs -- not a general-purpose
+    // class/subclass/slot/stat registry (ChatHelper::itemClasses/slots above
+    // already serve a different, name->id parsing direction for /wtb-style
+    // filters and don't cover every subclass this block can emit). Falls
+    // back to the raw numeric value for anything unmapped so a field is
+    // never silently dropped, only ever shown as a number instead of a name.
+    std::string GetItemClassContextName(uint32 itemClass, uint32 itemSubClass)
+    {
+        switch (itemClass)
+        {
+        case ITEM_CLASS_CONSUMABLE:
+            switch (itemSubClass)
+            {
+            case ITEM_SUBCLASS_POTION: return "Potion";
+            case ITEM_SUBCLASS_ELIXIR: return "Elixir";
+            case ITEM_SUBCLASS_FLASK: return "Flask";
+            case ITEM_SUBCLASS_SCROLL: return "Scroll";
+            case ITEM_SUBCLASS_FOOD: return "Food & Drink";
+            case ITEM_SUBCLASS_ITEM_ENHANCEMENT: return "Item Enhancement";
+            case ITEM_SUBCLASS_BANDAGE: return "Bandage";
+            default: return "Consumable";
+            }
+        case ITEM_CLASS_CONTAINER:
+            switch (itemSubClass)
+            {
+            case ITEM_SUBCLASS_SOUL_CONTAINER: return "Soul Bag";
+            case ITEM_SUBCLASS_HERB_CONTAINER: return "Herb Bag";
+            case ITEM_SUBCLASS_ENCHANTING_CONTAINER: return "Enchanting Bag";
+            case ITEM_SUBCLASS_ENGINEERING_CONTAINER: return "Engineering Bag";
+            case ITEM_SUBCLASS_GEM_CONTAINER: return "Gem Bag";
+            case ITEM_SUBCLASS_MINING_CONTAINER: return "Mining Bag";
+            case ITEM_SUBCLASS_LEATHERWORKING_CONTAINER: return "Leatherworking Bag";
+            default: return "Bag";
+            }
+        case ITEM_CLASS_WEAPON:
+            switch (itemSubClass)
+            {
+            case ITEM_SUBCLASS_WEAPON_AXE: return "One-Handed Axe";
+            case ITEM_SUBCLASS_WEAPON_AXE2: return "Two-Handed Axe";
+            case ITEM_SUBCLASS_WEAPON_BOW: return "Bow";
+            case ITEM_SUBCLASS_WEAPON_GUN: return "Gun";
+            case ITEM_SUBCLASS_WEAPON_MACE: return "One-Handed Mace";
+            case ITEM_SUBCLASS_WEAPON_MACE2: return "Two-Handed Mace";
+            case ITEM_SUBCLASS_WEAPON_POLEARM: return "Polearm";
+            case ITEM_SUBCLASS_WEAPON_SWORD: return "One-Handed Sword";
+            case ITEM_SUBCLASS_WEAPON_SWORD2: return "Two-Handed Sword";
+            case ITEM_SUBCLASS_WEAPON_STAFF: return "Staff";
+            case ITEM_SUBCLASS_WEAPON_FIST: return "Fist Weapon";
+            case ITEM_SUBCLASS_WEAPON_DAGGER: return "Dagger";
+            case ITEM_SUBCLASS_WEAPON_THROWN: return "Thrown Weapon";
+            case ITEM_SUBCLASS_WEAPON_SPEAR: return "Spear";
+            case ITEM_SUBCLASS_WEAPON_CROSSBOW: return "Crossbow";
+            case ITEM_SUBCLASS_WEAPON_WAND: return "Wand";
+            case ITEM_SUBCLASS_WEAPON_FISHING_POLE: return "Fishing Pole";
+            default: return "Weapon";
+            }
+        case ITEM_CLASS_GEM: return "Gem";
+        case ITEM_CLASS_ARMOR:
+            switch (itemSubClass)
+            {
+            case ITEM_SUBCLASS_ARMOR_CLOTH: return "Cloth Armor";
+            case ITEM_SUBCLASS_ARMOR_LEATHER: return "Leather Armor";
+            case ITEM_SUBCLASS_ARMOR_MAIL: return "Mail Armor";
+            case ITEM_SUBCLASS_ARMOR_PLATE: return "Plate Armor";
+            case ITEM_SUBCLASS_ARMOR_BUCKLER: return "Buckler";
+            case ITEM_SUBCLASS_ARMOR_SHIELD: return "Shield";
+            case ITEM_SUBCLASS_ARMOR_LIBRAM: return "Libram";
+            case ITEM_SUBCLASS_ARMOR_IDOL: return "Idol";
+            case ITEM_SUBCLASS_ARMOR_TOTEM: return "Totem";
+            default: return "Armor";
+            }
+        case ITEM_CLASS_REAGENT: return "Reagent";
+        case ITEM_CLASS_PROJECTILE:
+            switch (itemSubClass)
+            {
+            case ITEM_SUBCLASS_ARROW: return "Arrow";
+            case ITEM_SUBCLASS_BULLET: return "Bullet";
+            default: return "Projectile";
+            }
+        case ITEM_CLASS_TRADE_GOODS:
+            switch (itemSubClass)
+            {
+            case ITEM_SUBCLASS_PARTS: return "Parts";
+            case ITEM_SUBCLASS_EXPLOSIVES: return "Explosives";
+            case ITEM_SUBCLASS_DEVICES: return "Devices";
+            case ITEM_SUBCLASS_CLOTH: return "Cloth";
+            case ITEM_SUBCLASS_LEATHER: return "Leather";
+            case ITEM_SUBCLASS_METAL_STONE: return "Metal & Stone";
+            case ITEM_SUBCLASS_MEAT: return "Meat";
+            case ITEM_SUBCLASS_HERB: return "Herb";
+            case ITEM_SUBCLASS_ELEMENTAL: return "Elemental";
+            case ITEM_SUBCLASS_ENCHANTING: return "Enchanting";
+            default: return "Trade Goods";
+            }
+        case ITEM_CLASS_RECIPE:
+            switch (itemSubClass)
+            {
+            case ITEM_SUBCLASS_LEATHERWORKING_PATTERN: return "Leatherworking Pattern";
+            case ITEM_SUBCLASS_TAILORING_PATTERN: return "Tailoring Pattern";
+            case ITEM_SUBCLASS_ENGINEERING_SCHEMATIC: return "Engineering Schematic";
+            case ITEM_SUBCLASS_BLACKSMITHING: return "Blacksmithing Plan";
+            case ITEM_SUBCLASS_COOKING_RECIPE: return "Recipe";
+            case ITEM_SUBCLASS_ALCHEMY_RECIPE: return "Alchemy Recipe";
+            case ITEM_SUBCLASS_FIRST_AID_MANUAL: return "First Aid Manual";
+            case ITEM_SUBCLASS_ENCHANTING_FORMULA: return "Enchanting Formula";
+            case ITEM_SUBCLASS_FISHING_MANUAL: return "Fishing Manual";
+            case ITEM_SUBCLASS_JEWELCRAFT_PLANS: return "Jewelcrafting Design";
+            default: return "Recipe";
+            }
+        case ITEM_CLASS_MONEY: return "Money";
+        case ITEM_CLASS_QUIVER:
+            switch (itemSubClass)
+            {
+            case ITEM_SUBCLASS_AMMO_POUCH: return "Ammo Pouch";
+            default: return "Quiver";
+            }
+        case ITEM_CLASS_QUEST: return "Quest Item";
+        case ITEM_CLASS_KEY:
+            switch (itemSubClass)
+            {
+            case ITEM_SUBCLASS_LOCKPICK: return "Lockpick";
+            default: return "Key";
+            }
+        case ITEM_CLASS_PERMANENT: return "Permanent";
+        case ITEM_CLASS_JUNK: return "Junk";
+        default:
+            // Unknown class entirely -- fall back to the raw pair rather
+            // than guessing a name.
+            return "class " + std::to_string(itemClass) + "/" + std::to_string(itemSubClass);
+        }
+    }
+
+    std::string GetInventoryTypeContextName(uint32 invType)
+    {
+        switch (invType)
+        {
+        case INVTYPE_NON_EQUIP: return "Not equippable";
+        case INVTYPE_HEAD: return "Head";
+        case INVTYPE_NECK: return "Neck";
+        case INVTYPE_SHOULDERS: return "Shoulder";
+        case INVTYPE_BODY: return "Shirt";
+        case INVTYPE_CHEST: return "Chest";
+        case INVTYPE_WAIST: return "Waist";
+        case INVTYPE_LEGS: return "Legs";
+        case INVTYPE_FEET: return "Feet";
+        case INVTYPE_WRISTS: return "Wrist";
+        case INVTYPE_HANDS: return "Hands";
+        case INVTYPE_FINGER: return "Finger";
+        case INVTYPE_TRINKET: return "Trinket";
+        case INVTYPE_WEAPON: return "One-Hand";
+        case INVTYPE_SHIELD: return "Off Hand (Shield)";
+        case INVTYPE_RANGED: return "Ranged";
+        case INVTYPE_CLOAK: return "Back";
+        case INVTYPE_2HWEAPON: return "Two-Hand";
+        case INVTYPE_BAG: return "Bag";
+        case INVTYPE_TABARD: return "Tabard";
+        case INVTYPE_ROBE: return "Chest";
+        case INVTYPE_WEAPONMAINHAND: return "Main Hand";
+        case INVTYPE_WEAPONOFFHAND: return "Off Hand";
+        case INVTYPE_HOLDABLE: return "Held In Off-hand";
+        case INVTYPE_AMMO: return "Ammo";
+        case INVTYPE_THROWN: return "Thrown";
+        case INVTYPE_RANGEDRIGHT: return "Ranged";
+        case INVTYPE_QUIVER: return "Quiver";
+        case INVTYPE_RELIC: return "Relic";
+        default: return "invType " + std::to_string(invType);
+        }
+    }
+
+    std::string GetItemStatContextName(uint32 statType)
+    {
+        switch (statType)
+        {
+        case ITEM_MOD_MANA: return "Mana";
+        case ITEM_MOD_HEALTH: return "Health";
+        case ITEM_MOD_AGILITY: return "Agility";
+        case ITEM_MOD_STRENGTH: return "Strength";
+        case ITEM_MOD_INTELLECT: return "Intellect";
+        case ITEM_MOD_SPIRIT: return "Spirit";
+        case ITEM_MOD_STAMINA: return "Stamina";
+        default: return "stat " + std::to_string(statType);
+        }
+    }
+
+    // Human-readable reason for an equip check that did not come back
+    // EQUIP_ERR_OK, for the specific, common proficiency/eligibility codes
+    // (see Item.h's InventoryResult) -- returns "" for anything else rather
+    // than guess a reason that isn't really a proficiency/eligibility
+    // mismatch (e.g. a full inventory).
+    std::string GetEquipCheckReasonContextName(InventoryResult result)
+    {
+        switch (result)
+        {
+        case EQUIP_ERR_NO_REQUIRED_PROFICIENCY: return "lacks the required armor/weapon proficiency";
+        case EQUIP_ERR_YOU_CAN_NEVER_USE_THAT_ITEM:
+        case EQUIP_ERR_YOU_CAN_NEVER_USE_THAT_ITEM2: return "this class can never use this item";
+        case EQUIP_ERR_CANT_EQUIP_LEVEL_I: return "character level too low";
+        case EQUIP_ERR_CANT_EQUIP_SKILL: return "lacks the required skill";
+        case EQUIP_ERR_CANT_EQUIP_RANK: return "lacks the required rank";
+        case EQUIP_ERR_CANT_EQUIP_REPUTATION: return "lacks the required reputation";
+        default: return "";
+        }
+    }
+}
+
+std::string ChatHelper::BuildItemContextBlock(const std::string& message, Player* bot)
 {
     std::set<std::string> qualifierStrings = parseItemQualifiers(message);
     if (qualifierStrings.empty())
@@ -507,8 +716,42 @@ std::string ChatHelper::BuildItemContextBlock(const std::string& message)
         out << "- entry=" << proto->ItemId << " name=\"" << name << "\""
             << " quality=" << proto->Quality
             << " ilvl=" << proto->ItemLevel
-            << " class=" << proto->Class << "/" << proto->SubClass
-            << " invType=" << proto->InventoryType;
+            << " type=\"" << GetItemClassContextName(proto->Class, proto->SubClass) << "\""
+            << " slot=\"" << GetInventoryTypeContextName(proto->InventoryType) << "\"";
+
+        // Bot-specific, authoritative equip eligibility (2026-09-10) -- same
+        // equip checks ItemUsageValue::QueryItemUsageForEquip() itself uses
+        // for an item not currently in the bot's own bags
+        // (Player::CanUseItem() then, if that passes,
+        // RandomPlayerbotMgr::CanEquipUnseenItem()): class/race/level
+        // restrictions and armor/weapon proficiency all flow through these,
+        // so e.g. a Warlock + Leather item correctly comes back canEquip=no
+        // here. Only emitted for genuinely equippable slot types -- a
+        // non-equippable item (consumable, quest item, etc.) gets no
+        // canEquip field at all, same "don't invent a field" rule as the
+        // rest of this block. `reason` is included only when the equip
+        // check reports one of the specific, known proficiency/eligibility
+        // codes (see GetEquipCheckReasonContextName()) -- omitted rather
+        // than guessed otherwise.
+        if (bot && proto->InventoryType != INVTYPE_NON_EQUIP)
+        {
+            InventoryResult equipResult = bot->CanUseItem(proto);
+            if (equipResult == EQUIP_ERR_OK)
+            {
+                uint16 dest;
+                equipResult = RandomPlayerbotMgr::CanEquipUnseenItem(bot, NULL_SLOT, dest, proto->ItemId);
+            }
+
+            if (equipResult == EQUIP_ERR_OK)
+                out << " canEquip=yes";
+            else
+            {
+                out << " canEquip=no";
+                std::string equipReason = GetEquipCheckReasonContextName(equipResult);
+                if (!equipReason.empty())
+                    out << " reason=\"" << equipReason << "\"";
+            }
+        }
 
         if (proto->Armor)
             out << " armor=" << proto->Armor;
@@ -532,7 +775,7 @@ std::string ChatHelper::BuildItemContextBlock(const std::string& message)
             {
                 if (!statsStr.empty())
                     statsStr += ",";
-                statsStr += "mod" + std::to_string(proto->ItemStat[i].ItemStatType) + ":" + std::to_string(proto->ItemStat[i].ItemStatValue);
+                statsStr += GetItemStatContextName(proto->ItemStat[i].ItemStatType) + ":" + std::to_string(proto->ItemStat[i].ItemStatValue);
             }
         }
         if (!statsStr.empty())

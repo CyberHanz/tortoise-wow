@@ -223,8 +223,13 @@ namespace ai
         // the prompt. Ticket 4a scope only: no gear/upgrade comparison
         // against the bot's own equipment, no mailbox, no extra LLM call,
         // no per-tick work (only called from the chat-reply path, on an
-        // incoming message).
-        static std::string BuildItemContextBlock(const std::string& message);
+        // incoming message). `bot` (2026-09-10 addition) is only used to add
+        // a bot-specific, authoritative canEquip=yes/no (+ reason, when the
+        // equip check reports one) per item, via the same
+        // Player::CanUseItem()/RandomPlayerbotMgr::CanEquipUnseenItem()
+        // equip checks ItemUsageValue::QueryItemUsageForEquip() itself uses
+        // -- no new gear/upgrade comparison logic.
+        static std::string BuildItemContextBlock(const std::string& message, Player* bot);
 
         // Ticket 4a debug fix: deterministic clickable-itemlink post-
         // processing. Scans one already-generated bot reply `line` for a

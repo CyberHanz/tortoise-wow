@@ -784,13 +784,14 @@ void ChatReplyAction::ChatReplyDo(Player* bot, uint32 type, uint32 guid1, uint32
                 // existing for this item, never guessed or invented. The
                 // original required Dutch sentence is kept verbatim.
                 std::set<std::string> itemQualifierStrings = ChatHelper::parseItemQualifiers(msg);
-                std::string itemContextBlock = ChatHelper::BuildItemContextBlock(msg);
+                std::string itemContextBlock = ChatHelper::BuildItemContextBlock(msg, bot);
                 if (!itemContextBlock.empty())
                 {
                     jsonFill["<pre prompt>"] += " " + itemContextBlock +
-                        " This item data is authoritative and complete for these items -- if a field above (ilvl, quality, class/subclass, invType, armor, dmg, speed, stats, spells) answers the question, state it directly and do not say you don't know. "
+                        " This item data is authoritative and complete for these items -- if a field above (ilvl, quality, type, slot, canEquip, reason, armor, dmg, speed, stats, spells) answers the question, state it directly and do not say you don't know. "
                         "A field not listed above does not exist for this item -- leave it unmentioned rather than guessing. "
-                        "When you mention one of these items by name, use the exact name= value given above, verbatim -- never translate, abbreviate, or rephrase it. "
+                        "canEquip=no means you (this character) cannot wear or wield that item -- state plainly that you cannot use it (using reason= when given) and never describe it as something you could equip or are considering wearing, regardless of its stats. canEquip=yes means you are able to equip it; that alone says nothing about whether it is a good upgrade. "
+                        "You must mention the exact name= value of every item from this data at least once in your reply, verbatim, exactly as given -- never translate, abbreviate, paraphrase, or refer to it only as \"it\"/\"that item\" instead. "
                         "itemdata is authoritative; verzin geen ingrediënten, lore, effecten of item-acties die niet in deze data/context staan.";
                 }
 
@@ -1134,6 +1135,22 @@ void ChatReplyAction::ChatReplyDo(Player* bot, uint32 type, uint32 guid1, uint32
         SendGeneralResponse(bot, chatChannelSource, BuildMemoryFallbackText(memoryResult), name);
         return;
     }
+
+    // Grounding follow-up (2026-09-10): keep ELIZA (GenerateReplyMessage())
+    // a genuine "no LLM available" fallback. Reaching this point does not
+    // mean the bot lacks LLM chat capability -- the comment above already
+    // notes it also happens for an LLM-capable bot when
+    // AiPlayerbot.LLMBlockedReplyChannels excludes this channel, or the
+    // channel could not be classified (SRC_UNDEFINED). Substituting the
+    // legacy canned "Hello"/"Well met!" reply in those cases defeats the
+    // point of blocking the channel and makes ELIZA answer for reasons that
+    // have nothing to do with the bot actually lacking LLM chat capability.
+    // Stay silent instead for an LLM-capable bot; a bot that is genuinely
+    // not LLM-capable (LLM disabled server-wide, or this bot has no
+    // "ai chat" strategy) is unaffected and still gets the ELIZA reply
+    // below exactly as before.
+    if (GetBotAI(bot) && GetBotAI(bot)->IsLlmChatCapable())
+        return;
 
     SendGeneralResponse(bot, chatChannelSource, GenerateReplyMessage(bot, msg, guid1, name), name);
 }

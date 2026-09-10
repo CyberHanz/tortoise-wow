@@ -2676,7 +2676,15 @@ void PlayerbotAI::DoNextAction(bool min)
 
             if (GetMaster() == GetGroupMaster())
             {
-                TellPlayer(master, BOT_TEXT("hello_follow"));
+                // Grounding follow-up (2026-09-10): this branch used a
+                // different DB text key ("hello_follow") for the same
+                // master-assignment greeting event as the "hello" branch
+                // just below, and was missed by that branch's 2026-09-08
+                // gate -- so an LLM-capable bot kept saying "Hello, lead
+                // the way!"/"Lead on, I'm right behind you!" ahead of its
+                // own generated reply. Same fix, same reasoning as below.
+                if (!IsLlmChatCapable())
+                    TellPlayer(master, BOT_TEXT("hello_follow"));
             }
             // Grounding follow-up (2026-09-08): LLM-capable bots skip the
             // canned greeting here so it doesn't precede their own
